@@ -1,0 +1,76 @@
+# ============================================================================
+# Hermes Agent — Docker Compose
+# ============================================================================
+#
+# Usage:
+#   docker compose up -d          # Start in background
+#   docker compose exec hermes hermes          # Interactive chat
+#   docker compose exec hermes hermes setup    # Run setup wizard
+#   docker compose exec hermes bash            # Shell into container
+#   docker compose logs -f hermes              # View logs
+#   docker compose down                        # Stop
+#
+# First-run:
+#   1. Copy .env.example to ./hermes-data/.env and fill in API keys, OR
+#   2. Run: docker compose exec hermes hermes setup
+#
+# ============================================================================
+
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes-agent
+    hostname: hermes
+
+    # Required for Docker-in-Docker
+    privileged: true
+
+    # Keep container running (hermes CLI is started interactively via exec)
+    command: ["tail", "-f", "/dev/null"]
+
+    # Interactive terminal support for `docker compose exec`
+    stdin_open: true
+    tty: true
+
+    volumes:
+      # ── Hermes Agent source code (live mount) ──
+      # The host project repo is mounted into the container so the agent
+      # can edit source files and commit to the git repository.
+      - .:/opt/hermes-agent
+
+      # ── Persistent Hermes data (config, sessions, logs, memories, skills) ──
+      # All user data lives here — survives container rebuilds.
+      - ./hermes-data:/data/hermes
+
+      # ── Workspace directory for the agent to operate on ──
+      # Mount your projects here so the agent can read/write files.
+      # Change the host path to your actual projects directory.
+      - ./workspace:/workspace
+
+      # ── Docker-in-Docker storage ──
+      # Named volume for inner Docker's image/container layer storage.
+      - dind-storage:/var/lib/docker
+
+    environment:
+      # Hermes config directory (inside the container)
+      - HERMES_HOME=/data/hermes
+      # Working directory for terminal commands
+      - TERMINAL_CWD=/workspace
+      # Docker socket for DinD (used by hermes docker terminal backend)
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+
+    restart: unless-stopped
+
+volumes:
+  dind-storage:
+    driver: local
