@@ -153,22 +153,23 @@ relink_source() {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-# Start Docker-in-Docker
-start_dockerd
-
-# Run first-time setup
+# Run first-time setup before starting supervised services so log/config paths
+# exist and gateway can inherit variables from the persisted .env file.
 first_run_setup
 
 # Re-link source if host repo is mounted
 relink_source
 
-# Source .env into the environment so hermes picks up API keys
+# Source .env into the environment so hermes and supervised services pick up API keys
 if [ -f "${HERMES_HOME:-/data/hermes}/.env" ]; then
     set -a
     # shellcheck disable=SC1091
     . "${HERMES_HOME:-/data/hermes}/.env"
     set +a
 fi
+
+# Start Docker-in-Docker and other supervised background services (gateway)
+start_dockerd
 
 # If the user passed a command, run it; otherwise start hermes CLI
 if [ $# -eq 0 ]; then

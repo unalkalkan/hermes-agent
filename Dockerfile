@@ -109,4 +109,4 @@ RUN chmod +x /entrypoint.sh
 WORKDIR /workspace
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["hermes"]
+CMD ["hermes.py"]
