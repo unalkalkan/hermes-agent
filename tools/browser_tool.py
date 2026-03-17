@@ -53,6 +53,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import shutil
@@ -65,7 +66,21 @@ from typing import Dict, Any, Optional, List
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 
+try:
+    from tools.website_policy import check_website_access
+except Exception:
+    check_website_access = lambda url: None  # noqa: E731 — fail-open if policy module unavailable
+from tools.browser_providers.base import CloudBrowserProvider
+from tools.browser_providers.browserbase import BrowserbaseProvider
+from tools.browser_providers.browser_use import BrowserUseProvider
+
 logger = logging.getLogger(__name__)
+
+# Standard PATH entries for environments with minimal PATH (e.g. systemd services)
+_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Throttle screenshot cleanup to avoid repeated full directory scans.
+_last_screenshot_cleanup_by_dir: dict[str, float] = {}
 
 # ============================================================================
 # Configuration
@@ -91,14 +106,53 @@ def _get_extraction_model() -> Optional[str]:
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
-def _is_local_mode() -> bool:
-    """Return True when no Browserbase credentials are configured.
+def _get_cdp_override() -> str:
+    """Return a user-supplied CDP URL override, or empty string.
 
-    In local mode the browser tools launch a headless Chromium instance via
-    ``agent-browser --session`` instead of connecting to a remote Browserbase
-    session via ``--cdp``.
+    When ``BROWSER_CDP_URL`` is set (e.g. via ``/browser connect``), we skip
+    both Browserbase and the local headless launcher and connect directly to
+    the supplied Chrome DevTools Protocol endpoint.
     """
-    return not (os.environ.get("BROWSERBASE_API_KEY") and os.environ.get("BROWSERBASE_PROJECT_ID"))
+    return os.environ.get("BROWSER_CDP_URL", "").strip()
+
+
+# ============================================================================
+# Cloud Provider Registry
+# ============================================================================
+
+_PROVIDER_REGISTRY: Dict[str, type] = {
+    "browserbase": BrowserbaseProvider,
+    "browser-use": BrowserUseProvider,
+}
+
+_cached_cloud_provider: Optional[CloudBrowserProvider] = None
+_cloud_provider_resolved = False
+
+
+def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
+    """Return the configured cloud browser provider, or None for local mode.
+
+    Reads ``config["browser"]["cloud_provider"]`` once and caches the result
+    for the process lifetime.  If unset → local mode (None).
+    """
+    global _cached_cloud_provider, _cloud_provider_resolved
+    if _cloud_provider_resolved:
+        return _cached_cloud_provider
+
+    _cloud_provider_resolved = True
+    try:
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        config_path = hermes_home / "config.yaml"
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            provider_key = cfg.get("browser", {}).get("cloud_provider")
+            if provider_key and provider_key in _PROVIDER_REGISTRY:
+                _cached_cloud_provider = _PROVIDER_REGISTRY[provider_key]()
+    except Exception as e:
+        logger.debug("Could not read cloud_provider from config: %s", e)
+    return _cached_cloud_provider
 
 
 def _socket_safe_tmpdir() -> str:
@@ -159,82 +213,27 @@ def _emergency_cleanup_all_sessions():
     if not _active_sessions:
         return
     
-    logger.info("Emergency cleanup: closing %s active session(s)...", len(_active_sessions))
-    
+    logger.info("Emergency cleanup: closing %s active session(s)...",
+                len(_active_sessions))
+
     try:
-        if _is_local_mode():
-            # Local mode: just close agent-browser sessions via CLI
-            for task_id, session_info in list(_active_sessions.items()):
-                session_name = session_info.get("session_name")
-                if session_name:
-                    try:
-                        browser_cmd = _find_agent_browser()
-                        task_socket_dir = os.path.join(
-                            _socket_safe_tmpdir(),
-                            f"agent-browser-{session_name}"
-                        )
-                        env = {**os.environ, "AGENT_BROWSER_SOCKET_DIR": task_socket_dir}
-                        subprocess.run(
-                            browser_cmd.split() + ["--session", session_name, "--json", "close"],
-                            capture_output=True, timeout=5, env=env,
-                        )
-                        logger.info("Closed local session %s", session_name)
-                    except Exception as e:
-                        logger.debug("Error closing local session %s: %s", session_name, e)
-        else:
-            # Cloud mode: release Browserbase sessions via API
-            api_key = os.environ.get("BROWSERBASE_API_KEY")
-            project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-
-            if not api_key or not project_id:
-                logger.warning("Cannot cleanup - missing BROWSERBASE credentials")
-                return
-
-            for task_id, session_info in list(_active_sessions.items()):
-                bb_session_id = session_info.get("bb_session_id")
-                if bb_session_id:
-                    try:
-                        response = requests.post(
-                            f"https://api.browserbase.com/v1/sessions/{bb_session_id}",
-                            headers={
-                                "X-BB-API-Key": api_key,
-                                "Content-Type": "application/json"
-                            },
-                            json={
-                                "projectId": project_id,
-                                "status": "REQUEST_RELEASE"
-                            },
-                            timeout=5  # Short timeout for cleanup
-                        )
-                        if response.status_code in (200, 201, 204):
-                            logger.info("Closed session %s", bb_session_id)
-                        else:
-                            logger.warning("Failed to close session %s: HTTP %s", bb_session_id, response.status_code)
-                    except Exception as e:
-                        logger.error("Error closing session %s: %s", bb_session_id, e)
-        
-        _active_sessions.clear()
+        cleanup_all_browsers()
     except Exception as e:
         logger.error("Emergency cleanup error: %s", e)
+    finally:
+        with _cleanup_lock:
+            _active_sessions.clear()
+            _session_last_activity.clear()
+        _recording_sessions.clear()
 
 
-def _signal_handler(signum, frame):
-    """Handle interrupt signals to cleanup sessions before exit."""
-    logger.warning("Received signal %s, cleaning up...", signum)
-    _emergency_cleanup_all_sessions()
-    sys.exit(128 + signum)
-
-
-# Register cleanup handlers
+# Register cleanup via atexit only.  Previous versions installed SIGINT/SIGTERM
+# handlers that called sys.exit(), but this conflicts with prompt_toolkit's
+# async event loop — a SystemExit raised inside a key-binding callback
+# corrupts the coroutine state and makes the process unkillable.  atexit
+# handlers run on any normal exit (including sys.exit), so browser sessions
+# are still cleaned up without hijacking signals.
 atexit.register(_emergency_cleanup_all_sessions)
-
-# Only register signal handlers in main process (not in multiprocessing workers)
-try:
-    if os.getpid() == os.getpgrp():  # Main process check
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-except (OSError, AttributeError):
-    pass  # Signal handling not available (e.g., Windows or worker process)
 
 
 # =============================================================================
@@ -488,175 +487,30 @@ BROWSER_TOOL_SCHEMAS = [
 # Utility Functions
 # ============================================================================
 
-def _create_browserbase_session(task_id: str) -> Dict[str, str]:
-    """
-    Create a Browserbase session with stealth features.
-    
-    Browserbase Stealth Modes:
-    - Basic Stealth: ALWAYS enabled automatically. Generates random fingerprints,
-      viewports, and solves visual CAPTCHAs. No configuration needed.
-    - Advanced Stealth: Uses custom Chromium build for better bot detection avoidance.
-      Requires Scale Plan. Enable via BROWSERBASE_ADVANCED_STEALTH=true.
-    
-    Proxies are enabled by default to route traffic through residential IPs,
-    which significantly improves CAPTCHA solving rates. Can be disabled via
-    BROWSERBASE_PROXIES=false if needed.
-    
-    Args:
-        task_id: Unique identifier for the task
-        
-    Returns:
-        Dict with session_name, bb_session_id, cdp_url, and feature flags
-    """
-    import uuid
-    import sys
-    
-    config = _get_browserbase_config()
-    
-    # Check for optional settings from environment
-    # Proxies: enabled by default for better CAPTCHA solving
-    enable_proxies = os.environ.get("BROWSERBASE_PROXIES", "true").lower() != "false"
-    # Advanced Stealth: requires Scale Plan, disabled by default
-    enable_advanced_stealth = os.environ.get("BROWSERBASE_ADVANCED_STEALTH", "false").lower() == "true"
-    # keepAlive: enabled by default (requires paid plan) - allows reconnection after disconnects
-    enable_keep_alive = os.environ.get("BROWSERBASE_KEEP_ALIVE", "true").lower() != "false"
-    # Custom session timeout in milliseconds (optional) - extends session beyond project default
-    custom_timeout_ms = os.environ.get("BROWSERBASE_SESSION_TIMEOUT")
-    
-    # Track which features are actually enabled for logging/debugging
-    features_enabled = {
-        "basic_stealth": True,  # Always on
-        "proxies": False,
-        "advanced_stealth": False,
-        "keep_alive": False,
-        "custom_timeout": False,
-    }
-    
-    # Build session configuration
-    # Note: Basic stealth mode is ALWAYS active - no configuration needed
-    session_config = {
-        "projectId": config["project_id"],
-    }
-    
-    # Enable keepAlive for session reconnection (default: true, requires paid plan)
-    # Allows reconnecting to the same session after network hiccups
-    if enable_keep_alive:
-        session_config["keepAlive"] = True
-    
-    # Add custom timeout if specified (in milliseconds)
-    # This extends session duration beyond project's default timeout
-    if custom_timeout_ms:
-        try:
-            timeout_val = int(custom_timeout_ms)
-            if timeout_val > 0:
-                session_config["timeout"] = timeout_val
-        except ValueError:
-            logger.warning("Invalid BROWSERBASE_SESSION_TIMEOUT value: %s", custom_timeout_ms)
-    
-    # Enable proxies for better CAPTCHA solving (default: true)
-    # Routes traffic through residential IPs for more reliable access
-    if enable_proxies:
-        session_config["proxies"] = True
-    
-    # Add advanced stealth if enabled (requires Scale Plan)
-    # Uses custom Chromium build to avoid bot detection altogether
-    if enable_advanced_stealth:
-        session_config["browserSettings"] = {
-            "advancedStealth": True,
-        }
-    
-    # Create session via Browserbase API
-    response = requests.post(
-        "https://api.browserbase.com/v1/sessions",
-        headers={
-            "Content-Type": "application/json",
-            "X-BB-API-Key": config["api_key"],
-        },
-        json=session_config,
-        timeout=30
-    )
-    
-    # Track if we fell back from paid features
-    proxies_fallback = False
-    keepalive_fallback = False
-    
-    # Handle 402 Payment Required - likely paid features not available
-    # Try to identify which feature caused the issue and retry without it
-    if response.status_code == 402:
-        # First try without keepAlive (most likely culprit for paid plan requirement)
-        if enable_keep_alive:
-            keepalive_fallback = True
-            logger.warning("keepAlive may require paid plan (402), retrying without it. "
-                          "Sessions may timeout during long operations.")
-            session_config.pop("keepAlive", None)
-            response = requests.post(
-                "https://api.browserbase.com/v1/sessions",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-BB-API-Key": config["api_key"],
-                },
-                json=session_config,
-                timeout=30
-            )
-        
-        # If still 402, try without proxies too
-        if response.status_code == 402 and enable_proxies:
-            proxies_fallback = True
-            logger.warning("Proxies unavailable (402), retrying without proxies. "
-                          "Bot detection may be less effective.")
-            session_config.pop("proxies", None)
-            response = requests.post(
-                "https://api.browserbase.com/v1/sessions",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-BB-API-Key": config["api_key"],
-                },
-                json=session_config,
-                timeout=30
-            )
-    
-    if not response.ok:
-        raise RuntimeError(f"Failed to create Browserbase session: {response.status_code} {response.text}")
-    
-    session_data = response.json()
-    session_name = f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
-    
-    # Update features based on what actually succeeded
-    if enable_proxies and not proxies_fallback:
-        features_enabled["proxies"] = True
-    if enable_advanced_stealth:
-        features_enabled["advanced_stealth"] = True
-    if enable_keep_alive and not keepalive_fallback:
-        features_enabled["keep_alive"] = True
-    if custom_timeout_ms and "timeout" in session_config:
-        features_enabled["custom_timeout"] = True
-    
-    # Log session info for debugging
-    feature_str = ", ".join(k for k, v in features_enabled.items() if v)
-    logger.info("Created session %s with features: %s", session_name, feature_str)
-    
-    return {
-        "session_name": session_name,
-        "bb_session_id": session_data["id"],
-        "cdp_url": session_data["connectUrl"],
-        "features": features_enabled,
-    }
-
-
 def _create_local_session(task_id: str) -> Dict[str, str]:
-    """Create a lightweight local browser session (no cloud API call).
-
-    Returns the same dict shape as ``_create_browserbase_session`` so the rest
-    of the code can treat both modes uniformly.
-    """
     import uuid
-    session_name = f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
-    logger.info("Created local browser session %s", session_name)
+    session_name = f"h_{uuid.uuid4().hex[:10]}"
+    logger.info("Created local browser session %s for task %s",
+                session_name, task_id)
     return {
         "session_name": session_name,
-        "bb_session_id": None,   # Not applicable in local mode
-        "cdp_url": None,         # Not applicable in local mode
+        "bb_session_id": None,
+        "cdp_url": None,
         "features": {"local": True},
+    }
+
+
+def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
+    """Create a session that connects to a user-supplied CDP endpoint."""
+    import uuid
+    session_name = f"cdp_{uuid.uuid4().hex[:10]}"
+    logger.info("Created CDP browser session %s → %s for task %s",
+                session_name, cdp_url, task_id)
+    return {
+        "session_name": session_name,
+        "bb_session_id": None,
+        "cdp_url": cdp_url,
+        "features": {"cdp_override": True},
     }
 
 
@@ -690,12 +544,22 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
             return _active_sessions[task_id]
     
     # Create session outside the lock (network call in cloud mode)
-    if _is_local_mode():
-        session_info = _create_local_session(task_id)
+    cdp_override = _get_cdp_override()
+    if cdp_override:
+        session_info = _create_cdp_session(task_id, cdp_override)
     else:
-        session_info = _create_browserbase_session(task_id)
+        provider = _get_cloud_provider()
+        if provider is None:
+            session_info = _create_local_session(task_id)
+        else:
+            session_info = provider.create_session(task_id)
     
     with _cleanup_lock:
+        # Double-check: another thread may have created a session while we
+        # were doing the network call. Use the existing one to avoid leaking
+        # orphan cloud sessions.
+        if task_id in _active_sessions:
+            return _active_sessions[task_id]
         _active_sessions[task_id] = session_info
     
     return session_info
@@ -713,31 +577,6 @@ def _get_session_name(task_id: Optional[str] = None) -> str:
     """
     session_info = _get_session_info(task_id)
     return session_info["session_name"]
-
-
-def _get_browserbase_config() -> Dict[str, str]:
-    """
-    Get Browserbase configuration from environment.
-    
-    Returns:
-        Dict with api_key and project_id
-        
-    Raises:
-        ValueError: If required env vars are not set
-    """
-    api_key = os.environ.get("BROWSERBASE_API_KEY")
-    project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-    
-    if not api_key or not project_id:
-        raise ValueError(
-            "BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID environment variables are required. "
-            "Get your credentials at https://browserbase.com"
-        )
-    
-    return {
-        "api_key": api_key,
-        "project_id": project_id
-    }
 
 
 def _find_agent_browser() -> str:
@@ -774,6 +613,27 @@ def _find_agent_browser() -> str:
         "Or run 'npm install' in the repo root to install locally.\n"
         "Or ensure npx is available in your PATH."
     )
+
+
+def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
+    """Extract a screenshot file path from agent-browser human-readable output."""
+    if not text:
+        return None
+
+    patterns = [
+        r"Screenshot saved to ['\"](?P<path>/[^'\"]+?\.png)['\"]",
+        r"Screenshot saved to (?P<path>/\S+?\.png)(?:\s|$)",
+        r"(?P<path>/\S+?\.png)(?:\s|$)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            path = match.group("path").strip().strip("'\"")
+            if path:
+                return path
+
+    return None
 
 
 def _run_browser_command(
@@ -845,66 +705,128 @@ def _run_browser_command(
                      command, task_id, task_socket_dir, len(task_socket_dir))
         
         browser_env = {**os.environ}
-        # Ensure PATH includes standard dirs (systemd services may have minimal PATH)
-        _SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        if "/usr/bin" not in browser_env.get("PATH", "").split(":"):
-            browser_env["PATH"] = f"{browser_env.get('PATH', '')}:{_SANE_PATH}"
+
+        # Ensure PATH includes Hermes-managed Node first, then standard system dirs.
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_node_bin = str(hermes_home / "node" / "bin")
+
+        existing_path = browser_env.get("PATH", "")
+        path_parts = [p for p in existing_path.split(":") if p]
+        candidate_dirs = [hermes_node_bin] + [p for p in _SANE_PATH.split(":") if p]
+
+        for part in reversed(candidate_dirs):
+            if os.path.isdir(part) and part not in path_parts:
+                path_parts.insert(0, part)
+
+        browser_env["PATH"] = ":".join(path_parts)
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
         
-        result = subprocess.run(
-            cmd_parts,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=browser_env,
-        )
-        
+        # Use temp files for stdout/stderr instead of pipes.
+        # agent-browser starts a background daemon that inherits file
+        # descriptors.  With capture_output=True (pipes), the daemon keeps
+        # the pipe fds open after the CLI exits, so communicate() never
+        # sees EOF and blocks until the timeout fires.
+        stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
+        stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
+        stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            proc = subprocess.Popen(
+                cmd_parts,
+                stdout=stdout_fd,
+                stderr=stderr_fd,
+                stdin=subprocess.DEVNULL,
+                env=browser_env,
+            )
+        finally:
+            os.close(stdout_fd)
+            os.close(stderr_fd)
+
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
+                           command, timeout, task_id, task_socket_dir)
+            return {"success": False, "error": f"Command timed out after {timeout} seconds"}
+
+        with open(stdout_path, "r") as f:
+            stdout = f.read()
+        with open(stderr_path, "r") as f:
+            stderr = f.read()
+        returncode = proc.returncode
+
+        # Clean up temp files (best-effort)
+        for p in (stdout_path, stderr_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
         # Log stderr for diagnostics — use warning level on failure so it's visible
-        if result.stderr and result.stderr.strip():
-            level = logging.WARNING if result.returncode != 0 else logging.DEBUG
-            logger.log(level, "browser '%s' stderr: %s", command, result.stderr.strip()[:500])
+        if stderr and stderr.strip():
+            level = logging.WARNING if returncode != 0 else logging.DEBUG
+            logger.log(level, "browser '%s' stderr: %s", command, stderr.strip()[:500])
         
         # Log empty output as warning — common sign of broken agent-browser
-        if not result.stdout.strip() and result.returncode == 0:
+        if not stdout.strip() and returncode == 0:
             logger.warning("browser '%s' returned empty stdout with rc=0. "
                            "cmd=%s stderr=%s",
                            command, " ".join(cmd_parts[:4]) + "...",
-                           (result.stderr or "")[:200])
+                           (stderr or "")[:200])
 
-        # Parse JSON output
-        if result.stdout.strip():
+        stdout_text = stdout.strip()
+
+        if stdout_text:
             try:
-                parsed = json.loads(result.stdout.strip())
+                parsed = json.loads(stdout_text)
                 # Warn if snapshot came back empty (common sign of daemon/CDP issues)
                 if command == "snapshot" and parsed.get("success"):
                     snap_data = parsed.get("data", {})
                     if not snap_data.get("snapshot") and not snap_data.get("refs"):
                         logger.warning("snapshot returned empty content. "
                                        "Possible stale daemon or CDP connection issue. "
-                                       "returncode=%s", result.returncode)
+                                       "returncode=%s", returncode)
                 return parsed
             except json.JSONDecodeError:
-                # Non-JSON output indicates agent-browser crash or version mismatch
-                raw = result.stdout.strip()[:500]
+                raw = stdout_text[:2000]
                 logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
-                               command, result.returncode, raw[:200])
+                               command, returncode, raw[:500])
+
+                if command == "screenshot":
+                    stderr_text = (stderr or "").strip()
+                    combined_text = "\n".join(
+                        part for part in [stdout_text, stderr_text] if part
+                    )
+                    recovered_path = _extract_screenshot_path_from_text(combined_text)
+
+                    if recovered_path and Path(recovered_path).exists():
+                        logger.info(
+                            "browser 'screenshot' recovered file from non-JSON output: %s",
+                            recovered_path,
+                        )
+                        return {
+                            "success": True,
+                            "data": {
+                                "path": recovered_path,
+                                "raw": raw,
+                            },
+                        }
+
                 return {
-                    "success": True,
-                    "data": {"raw": raw}
+                    "success": False,
+                    "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
                 }
         
         # Check for errors
-        if result.returncode != 0:
-            error_msg = result.stderr.strip() if result.stderr else f"Command failed with code {result.returncode}"
-            logger.warning("browser '%s' failed (rc=%s): %s", command, result.returncode, error_msg[:300])
+        if returncode != 0:
+            error_msg = stderr.strip() if stderr else f"Command failed with code {returncode}"
+            logger.warning("browser '%s' failed (rc=%s): %s", command, returncode, error_msg[:300])
             return {"success": False, "error": error_msg}
         
         return {"success": True, "data": {}}
         
-    except subprocess.TimeoutExpired:
-        logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
-                       command, timeout, task_id, task_socket_dir)
-        return {"success": False, "error": f"Command timed out after {timeout} seconds"}
     except Exception as e:
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         return {"success": False, "error": str(e)}
@@ -989,6 +911,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    # Website policy check — block before navigating
+    blocked = check_website_access(url)
+    if blocked:
+        return json.dumps({
+            "success": False,
+            "error": blocked["message"],
+            "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
+        })
+
     effective_task_id = task_id or "default"
     
     # Get session info to check if this is a new session
@@ -1255,46 +1186,26 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
 def browser_close(task_id: Optional[str] = None) -> str:
     """
     Close the browser session.
-    
+
     Args:
         task_id: Task identifier for session isolation
-        
+
     Returns:
         JSON string with close result
     """
     effective_task_id = task_id or "default"
-    
-    # Stop auto-recording before closing
-    _maybe_stop_recording(effective_task_id)
-    
-    result = _run_browser_command(effective_task_id, "close", [])
-    
-    # Close the backend session (Browserbase API in cloud mode, nothing extra in local mode)
-    session_key = task_id if task_id and task_id in _active_sessions else "default"
-    if session_key in _active_sessions:
-        session_info = _active_sessions[session_key]
-        bb_session_id = session_info.get("bb_session_id")
-        if bb_session_id:
-            # Cloud mode: release the Browserbase session via API
-            try:
-                config = _get_browserbase_config()
-                _close_browserbase_session(bb_session_id, config["api_key"], config["project_id"])
-            except Exception as e:
-                logger.warning("Could not close BrowserBase session: %s", e)
-        del _active_sessions[session_key]
-    
-    if result.get("success"):
-        return json.dumps({
-            "success": True,
-            "closed": True
-        }, ensure_ascii=False)
-    else:
-        # Even if close fails, session was released
-        return json.dumps({
-            "success": True,
-            "closed": True,
-            "warning": result.get("error", "Session may not have been active")
-        }, ensure_ascii=False)
+    with _cleanup_lock:
+        had_session = effective_task_id in _active_sessions
+
+    cleanup_browser(effective_task_id)
+
+    response = {
+        "success": True,
+        "closed": True,
+    }
+    if not had_session:
+        response["warning"] = "Session may not have been active"
+    return json.dumps(response, ensure_ascii=False)
 
 
 def browser_console(clear: bool = False, task_id: Optional[str] = None) -> str:
@@ -1486,9 +1397,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         _cleanup_old_screenshots(screenshots_dir, max_age_hours=24)
         
         # Take screenshot using agent-browser
-        screenshot_args = [str(screenshot_path)]
+        screenshot_args = []
         if annotate:
-            screenshot_args.insert(0, "--annotate")
+            screenshot_args.append("--annotate")
+        screenshot_args.append("--full")
+        screenshot_args.append(str(screenshot_path))
         result = _run_browser_command(
             effective_task_id, 
             "screenshot", 
@@ -1498,15 +1411,21 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         
         if not result.get("success"):
             error_detail = result.get("error", "Unknown error")
-            mode = "local" if _is_local_mode() else "cloud"
+            _cp = _get_cloud_provider()
+            mode = "local" if _cp is None else f"cloud ({_cp.provider_name()})"
             return json.dumps({
                 "success": False,
                 "error": f"Failed to take screenshot ({mode} mode): {error_detail}"
             }, ensure_ascii=False)
-        
+
+        actual_screenshot_path = result.get("data", {}).get("path")
+        if actual_screenshot_path:
+            screenshot_path = Path(actual_screenshot_path)
+
         # Check if screenshot file was created
         if not screenshot_path.exists():
-            mode = "local" if _is_local_mode() else "cloud"
+            _cp = _get_cloud_provider()
+            mode = "local" if _cp is None else f"cloud ({_cp.provider_name()})"
             return json.dumps({
                 "success": False,
                 "error": (
@@ -1578,8 +1497,17 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
 
 
 def _cleanup_old_screenshots(screenshots_dir, max_age_hours=24):
-    """Remove browser screenshots older than max_age_hours to prevent disk bloat."""
-    import time
+    """Remove browser screenshots older than max_age_hours to prevent disk bloat.
+
+    Throttled to run at most once per hour per directory to avoid repeated
+    scans on screenshot-heavy workflows.
+    """
+    key = str(screenshots_dir)
+    now = time.time()
+    if now - _last_screenshot_cleanup_by_dir.get(key, 0.0) < 3600:
+        return
+    _last_screenshot_cleanup_by_dir[key] = now
+
     try:
         cutoff = time.time() - (max_age_hours * 3600)
         for f in screenshots_dir.glob("browser_screenshot_*.png"):
@@ -1614,48 +1542,6 @@ def _cleanup_old_recordings(max_age_hours=72):
 # ============================================================================
 # Cleanup and Management Functions
 # ============================================================================
-
-def _close_browserbase_session(session_id: str, api_key: str, project_id: str) -> bool:
-    """
-    Close a Browserbase session immediately via the API.
-    
-    Uses POST /v1/sessions/{id} with status=REQUEST_RELEASE to immediately
-    terminate the session without waiting for keepAlive timeout.
-    
-    Args:
-        session_id: The Browserbase session ID
-        api_key: Browserbase API key
-        project_id: Browserbase project ID
-        
-    Returns:
-        True if session was successfully closed, False otherwise
-    """
-    try:
-        # POST to update session status to REQUEST_RELEASE
-        response = requests.post(
-            f"https://api.browserbase.com/v1/sessions/{session_id}",
-            headers={
-                "X-BB-API-Key": api_key,
-                "Content-Type": "application/json"
-            },
-            json={
-                "projectId": project_id,
-                "status": "REQUEST_RELEASE"
-            },
-            timeout=10
-        )
-        
-        if response.status_code in (200, 201, 204):
-            logger.debug("Successfully closed BrowserBase session %s", session_id)
-            return True
-        else:
-            logger.warning("Failed to close session %s: HTTP %s - %s", session_id, response.status_code, response.text[:200])
-            return False
-                
-    except Exception as e:
-        logger.error("Exception closing session %s: %s", session_id, e)
-        return False
-
 
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """
@@ -1697,15 +1583,14 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
             _active_sessions.pop(task_id, None)
             _session_last_activity.pop(task_id, None)
         
-        # Cloud mode: close the Browserbase session via API
-        if bb_session_id and not _is_local_mode():
-            try:
-                config = _get_browserbase_config()
-                success = _close_browserbase_session(bb_session_id, config["api_key"], config["project_id"])
-                if not success:
-                    logger.warning("Could not close BrowserBase session %s", bb_session_id)
-            except Exception as e:
-                logger.error("Exception during BrowserBase session close: %s", e)
+        # Cloud mode: close the cloud browser session via provider API
+        if bb_session_id:
+            provider = _get_cloud_provider()
+            if provider is not None:
+                try:
+                    provider.close_session(bb_session_id)
+                except Exception as e:
+                    logger.warning("Could not close cloud browser session: %s", e)
         
         # Kill the daemon process and clean up socket directory
         session_name = session_info.get("session_name", "")
@@ -1774,12 +1659,10 @@ def check_browser_requirements() -> bool:
     except FileNotFoundError:
         return False
 
-    # In cloud mode, also require Browserbase credentials
-    if not _is_local_mode():
-        api_key = os.environ.get("BROWSERBASE_API_KEY")
-        project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-        if not api_key or not project_id:
-            return False
+    # In cloud mode, also require provider credentials
+    provider = _get_cloud_provider()
+    if provider is not None and not provider.is_configured():
+        return False
 
     return True
 
@@ -1795,7 +1678,8 @@ if __name__ == "__main__":
     print("🌐 Browser Tool Module")
     print("=" * 40)
 
-    mode = "local" if _is_local_mode() else "cloud (Browserbase)"
+    _cp = _get_cloud_provider()
+    mode = "local" if _cp is None else f"cloud ({_cp.provider_name()})"
     print(f"   Mode: {mode}")
     
     # Check requirements
@@ -1808,12 +1692,9 @@ if __name__ == "__main__":
         except FileNotFoundError:
             print("   - agent-browser CLI not found")
             print("     Install: npm install -g agent-browser && agent-browser install --with-deps")
-        if not _is_local_mode():
-            if not os.environ.get("BROWSERBASE_API_KEY"):
-                print("   - BROWSERBASE_API_KEY not set (required for cloud mode)")
-            if not os.environ.get("BROWSERBASE_PROJECT_ID"):
-                print("   - BROWSERBASE_PROJECT_ID not set (required for cloud mode)")
-            print("   Tip: unset BROWSERBASE_API_KEY to use free local mode instead")
+        if _cp is not None and not _cp.is_configured():
+            print(f"   - {_cp.provider_name()} credentials not configured")
+            print("   Tip: remove cloud_provider from config to use free local mode instead")
     
     print("\n📋 Available Browser Tools:")
     for schema in BROWSER_TOOL_SCHEMAS:
@@ -1838,6 +1719,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
     handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="🌐",
 )
 registry.register(
     name="browser_snapshot",
@@ -1846,27 +1728,31 @@ registry.register(
     handler=lambda args, **kw: browser_snapshot(
         full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
     check_fn=check_browser_requirements,
+    emoji="📸",
 )
 registry.register(
     name="browser_click",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_click"],
-    handler=lambda args, **kw: browser_click(**args, task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="👆",
 )
 registry.register(
     name="browser_type",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_type"],
-    handler=lambda args, **kw: browser_type(**args, task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="⌨️",
 )
 registry.register(
     name="browser_scroll",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_scroll"],
-    handler=lambda args, **kw: browser_scroll(**args, task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="📜",
 )
 registry.register(
     name="browser_back",
@@ -1874,6 +1760,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_back"],
     handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="◀️",
 )
 registry.register(
     name="browser_press",
@@ -1881,6 +1768,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_press"],
     handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="⌨️",
 )
 registry.register(
     name="browser_close",
@@ -1888,6 +1776,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_close"],
     handler=lambda args, **kw: browser_close(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="🚪",
 )
 registry.register(
     name="browser_get_images",
@@ -1895,6 +1784,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_get_images"],
     handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="🖼️",
 )
 registry.register(
     name="browser_vision",
@@ -1902,6 +1792,7 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
     handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="👁️",
 )
 registry.register(
     name="browser_console",
@@ -1909,4 +1800,5 @@ registry.register(
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
+    emoji="🖥️",
 )

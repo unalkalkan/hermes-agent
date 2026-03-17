@@ -46,6 +46,7 @@ _PROVIDER_ENV_HINTS = (
     "KIMI_API_KEY",
     "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY",
+    "KILOCODE_API_KEY",
 )
 
 
@@ -92,6 +93,39 @@ def check_fail(text: str, detail: str = ""):
 
 def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
+
+
+def _check_gateway_service_linger(issues: list[str]) -> None:
+    """Warn when a systemd user gateway service will stop after logout."""
+    try:
+        from hermes_cli.gateway import (
+            get_systemd_linger_status,
+            get_systemd_unit_path,
+            is_linux,
+        )
+    except Exception as e:
+        check_warn("Gateway service linger", f"(could not import gateway helpers: {e})")
+        return
+
+    if not is_linux():
+        return
+
+    unit_path = get_systemd_unit_path()
+    if not unit_path.exists():
+        return
+
+    print()
+    print(color("◆ Gateway Service", Colors.CYAN, Colors.BOLD))
+
+    linger_enabled, linger_detail = get_systemd_linger_status()
+    if linger_enabled is True:
+        check_ok("Systemd linger enabled", "(gateway service survives logout)")
+    elif linger_enabled is False:
+        check_warn("Systemd linger disabled", "(gateway may stop after logout)")
+        check_info("Run: sudo loginctl enable-linger $USER")
+        issues.append("Enable linger for the gateway user service: sudo loginctl enable-linger $USER")
+    else:
+        check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
 def run_doctor(args):
@@ -348,6 +382,8 @@ def run_doctor(args):
             check_warn(f"~/.hermes/state.db exists but has issues: {e}")
     else:
         check_info("~/.hermes/state.db not created yet (will be created on first session)")
+
+    _check_gateway_service_linger(issues)
     
     # =========================================================================
     # Check: External tools
@@ -535,6 +571,8 @@ def run_doctor(args):
         # MiniMax APIs don't support /models endpoint — https://github.com/NousResearch/hermes-agent/issues/811
         ("MiniMax",          ("MINIMAX_API_KEY",),                            None,                                  "MINIMAX_BASE_URL", False),
         ("MiniMax (China)",  ("MINIMAX_CN_API_KEY",),                         None,                                  "MINIMAX_CN_BASE_URL", False),
+        ("AI Gateway",       ("AI_GATEWAY_API_KEY",),                          "https://ai-gateway.vercel.sh/v1/models", "AI_GATEWAY_BASE_URL", True),
+        ("Kilo Code",        ("KILOCODE_API_KEY",),                            "https://api.kilo.ai/api/gateway/models",  "KILOCODE_BASE_URL", True),
     ]
     for _pname, _env_vars, _default_url, _base_env, _supports_health_check in _apikey_providers:
         _key = ""

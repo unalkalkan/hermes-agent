@@ -7,6 +7,7 @@ persistence via bind mounts.
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,42 @@ _DOCKER_SEARCH_PATHS = [
 ]
 
 _docker_executable: Optional[str] = None  # resolved once, cached
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
+    """Return a deduplicated list of valid environment variable names."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for item in forward_env or []:
+        if not isinstance(item, str):
+            logger.warning("Ignoring non-string docker_forward_env entry: %r", item)
+            continue
+
+        key = item.strip()
+        if not key:
+            continue
+        if not _ENV_VAR_NAME_RE.match(key):
+            logger.warning("Ignoring invalid docker_forward_env entry: %r", item)
+            continue
+        if key in seen:
+            continue
+
+        seen.add(key)
+        normalized.append(key)
+
+    return normalized
+
+
+def _load_hermes_env_vars() -> dict[str, str]:
+    """Load ~/.hermes/.env values without failing Docker command execution."""
+    try:
+        from hermes_cli.config import load_env
+
+        return load_env() or {}
+    except Exception:
+        return {}
 
 
 def find_docker() -> Optional[str]:
@@ -82,6 +119,72 @@ _SECURITY_ARGS = [
 _storage_opt_ok: Optional[bool] = None  # cached result across instances
 
 
+def _ensure_docker_available() -> None:
+    """Best-effort check that the docker CLI is available before use.
+
+    Reuses ``find_docker()`` so this preflight stays consistent with the rest of
+    the Docker backend, including known non-PATH Docker Desktop locations.
+    """
+    docker_exe = find_docker()
+    if not docker_exe:
+        logger.error(
+            "Docker backend selected but no docker executable was found in PATH "
+            "or known install locations. Install Docker Desktop and ensure the "
+            "CLI is available."
+        )
+        raise RuntimeError(
+            "Docker executable not found in PATH or known install locations. "
+            "Install Docker and ensure the 'docker' command is available."
+        )
+
+    try:
+        result = subprocess.run(
+            [docker_exe, "version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        logger.error(
+            "Docker backend selected but the resolved docker executable '%s' could "
+            "not be executed.",
+            docker_exe,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            "Docker executable could not be executed. Check your Docker installation."
+        )
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "Docker backend selected but '%s version' timed out. "
+            "The Docker daemon may not be running.",
+            docker_exe,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            "Docker daemon is not responding. Ensure Docker is running and try again."
+        )
+    except Exception:
+        logger.error(
+            "Unexpected error while checking Docker availability.",
+            exc_info=True,
+        )
+        raise
+    else:
+        if result.returncode != 0:
+            logger.error(
+                "Docker backend selected but '%s version' failed "
+                "(exit code %d, stderr=%s)",
+                docker_exe,
+                result.returncode,
+                result.stderr.strip(),
+            )
+            raise RuntimeError(
+                "Docker command is available but 'docker version' failed. "
+                "Check your Docker installation."
+            )
+
+
 class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
@@ -105,7 +208,10 @@ class DockerEnvironment(BaseEnvironment):
         persistent_filesystem: bool = False,
         task_id: str = "default",
         volumes: list = None,
+        forward_env: list[str] | None = None,
         network: bool = True,
+        host_cwd: str = None,
+        auto_mount_cwd: bool = False,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -113,12 +219,17 @@ class DockerEnvironment(BaseEnvironment):
         self._base_image = image
         self._persistent = persistent_filesystem
         self._task_id = task_id
+        self._forward_env = _normalize_forward_env_names(forward_env)
         self._container_id: Optional[str] = None
         logger.info(f"DockerEnvironment volumes: {volumes}")
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
             logger.warning(f"docker_volumes config is not a list: {volumes!r}")
             volumes = []
+
+        # Fail fast if Docker is not available rather than surfacing a cryptic
+        # FileNotFoundError deep inside the mini-swe-agent stack.
+        _ensure_docker_available()
 
         from minisweagent.environments.docker import DockerEnvironment as _Docker
 
@@ -144,30 +255,9 @@ class DockerEnvironment(BaseEnvironment):
         # mode uses tmpfs (ephemeral, fast, gone on cleanup).
         from tools.environments.base import get_sandbox_dir
 
-        self._workspace_dir: Optional[str] = None
-        self._home_dir: Optional[str] = None
-        if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
-            self._workspace_dir = str(sandbox / "workspace")
-            self._home_dir = str(sandbox / "home")
-            os.makedirs(self._workspace_dir, exist_ok=True)
-            os.makedirs(self._home_dir, exist_ok=True)
-            writable_args = [
-                "-v", f"{self._workspace_dir}:/workspace",
-                "-v", f"{self._home_dir}:/root",
-            ]
-        else:
-            writable_args = [
-                "--tmpfs", "/workspace:rw,exec,size=10g",
-                "--tmpfs", "/home:rw,exec,size=1g",
-                "--tmpfs", "/root:rw,exec,size=1g",
-            ]
-
-        # All containers get security hardening (capabilities dropped, no privilege
-        # escalation, PID limits). The container filesystem is writable so agents
-        # can install packages as needed.
         # User-configured volume mounts (from config.yaml docker_volumes)
         volume_args = []
+        workspace_explicitly_mounted = False
         for vol in (volumes or []):
             if not isinstance(vol, str):
                 logger.warning(f"Docker volume entry is not a string: {vol!r}")
@@ -177,8 +267,52 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if ":" in vol:
                 volume_args.extend(["-v", vol])
+                if ":/workspace" in vol:
+                    workspace_explicitly_mounted = True
             else:
                 logger.warning(f"Docker volume '{vol}' missing colon, skipping")
+
+        host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
+        bind_host_cwd = (
+            auto_mount_cwd
+            and bool(host_cwd_abs)
+            and os.path.isdir(host_cwd_abs)
+            and not workspace_explicitly_mounted
+        )
+        if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
+            logger.debug(f"Skipping docker cwd mount: host_cwd is not a valid directory: {host_cwd}")
+
+        self._workspace_dir: Optional[str] = None
+        self._home_dir: Optional[str] = None
+        writable_args = []
+        if self._persistent:
+            sandbox = get_sandbox_dir() / "docker" / task_id
+            self._home_dir = str(sandbox / "home")
+            os.makedirs(self._home_dir, exist_ok=True)
+            writable_args.extend([
+                "-v", f"{self._home_dir}:/root",
+            ])
+            if not bind_host_cwd and not workspace_explicitly_mounted:
+                self._workspace_dir = str(sandbox / "workspace")
+                os.makedirs(self._workspace_dir, exist_ok=True)
+                writable_args.extend([
+                    "-v", f"{self._workspace_dir}:/workspace",
+                ])
+        else:
+            if not bind_host_cwd and not workspace_explicitly_mounted:
+                writable_args.extend([
+                    "--tmpfs", "/workspace:rw,exec,size=10g",
+                ])
+            writable_args.extend([
+                "--tmpfs", "/home:rw,exec,size=1g",
+                "--tmpfs", "/root:rw,exec,size=1g",
+            ])
+
+        if bind_host_cwd:
+            logger.info(f"Mounting configured host cwd to /workspace: {host_cwd_abs}")
+            volume_args = ["-v", f"{host_cwd_abs}:/workspace", *volume_args]
+        elif workspace_explicitly_mounted:
+            logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
 
         logger.info(f"Docker volume_args: {volume_args}")
         all_run_args = list(_SECURITY_ARGS) + writable_args + resource_args + volume_args
@@ -260,8 +394,12 @@ class DockerEnvironment(BaseEnvironment):
         if effective_stdin is not None:
             cmd.append("-i")
         cmd.extend(["-w", work_dir])
-        for key in self._inner.config.forward_env:
-            if (value := os.getenv(key)) is not None:
+        hermes_env = _load_hermes_env_vars() if self._forward_env else {}
+        for key in self._forward_env:
+            value = os.getenv(key)
+            if value is None:
+                value = hermes_env.get(key)
+            if value is not None:
                 cmd.extend(["-e", f"{key}={value}"])
         for key, value in self._inner.config.env.items():
             cmd.extend(["-e", f"{key}={value}"])
@@ -319,6 +457,20 @@ class DockerEnvironment(BaseEnvironment):
     def cleanup(self):
         """Stop and remove the container. Bind-mount dirs persist if persistent=True."""
         self._inner.cleanup()
+
+        if not self._persistent and self._container_id:
+            # Inner cleanup only runs `docker stop` in background; container is left
+            # as stopped. When container_persistent=false we must remove it.
+            docker_exe = find_docker() or self._inner.config.executable
+            try:
+                subprocess.run(
+                    [docker_exe, "rm", "-f", self._container_id],
+                    capture_output=True,
+                    timeout=30,
+                )
+            except Exception as e:
+                logger.warning("Failed to remove non-persistent container %s: %s", self._container_id, e)
+            self._container_id = None
 
         if not self._persistent:
             import shutil

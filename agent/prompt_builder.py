@@ -56,6 +56,61 @@ def _scan_context_content(content: str, filename: str) -> str:
 
     return content
 
+
+def _find_git_root(start: Path) -> Optional[Path]:
+    """Walk *start* and its parents looking for a ``.git`` directory.
+
+    Returns the directory containing ``.git``, or ``None`` if we hit the
+    filesystem root without finding one.
+    """
+    current = start.resolve()
+    for parent in [current, *current.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+_HERMES_MD_NAMES = (".hermes.md", "HERMES.md")
+
+
+def _find_hermes_md(cwd: Path) -> Optional[Path]:
+    """Discover the nearest ``.hermes.md`` or ``HERMES.md``.
+
+    Search order: *cwd* first, then each parent directory up to (and
+    including) the git repository root.  Returns the first match, or
+    ``None`` if nothing is found.
+    """
+    stop_at = _find_git_root(cwd)
+    current = cwd.resolve()
+
+    for directory in [current, *current.parents]:
+        for name in _HERMES_MD_NAMES:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+        # Stop walking at the git root (or filesystem root).
+        if stop_at and directory == stop_at:
+            break
+    return None
+
+
+def _strip_yaml_frontmatter(content: str) -> str:
+    """Remove optional YAML frontmatter (``---`` delimited) from *content*.
+
+    The frontmatter may contain structured config (model overrides, tool
+    settings) that will be handled separately in a future PR.  For now we
+    strip it so only the human-readable markdown body is injected into the
+    system prompt.
+    """
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end != -1:
+            # Skip past the closing --- and any trailing newline
+            body = content[end + 4:].lstrip("\n")
+            return body if body else content
+    return content
+
+
 # =========================================================================
 # Constants
 # =========================================================================
@@ -71,21 +126,32 @@ DEFAULT_AGENT_IDENTITY = (
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Proactively save important things "
-    "you learn (user preferences, environment details, useful approaches) and do "
-    "(like a diary!) using the memory tool -- don't wait to be asked."
+    "You have persistent memory across sessions. Save durable facts using the memory "
+    "tool: user preferences, environment details, tool quirks, and stable conventions. "
+    "Memory is injected into every turn, so keep it compact and focused on facts that "
+    "will still matter later.\n"
+    "Prioritize what reduces future user steering — the most valuable memory is one "
+    "that prevents the user from having to correct or remind you again. "
+    "User preferences and recurring corrections matter more than procedural task details.\n"
+    "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
+    "state to memory; use session_search to recall those from past transcripts. "
+    "If you've discovered a new way to do something, solved a problem that could be "
+    "necessary later, save it as a skill with the skill tool."
 )
 
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect "
-    "relevant prior context exists, use session_search to recall it before asking "
-    "them to repeat themselves."
+    "relevant cross-session context exists, use session_search to recall it before "
+    "asking them to repeat themselves."
 )
 
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, consider saving the approach as a "
-    "skill with skill_manage so you can reuse it next time."
+    "or discovering a non-trivial workflow, save the approach as a "
+    "skill with skill_manage so you can reuse it next time.\n"
+    "When using a skill and finding it outdated, incomplete, or wrong, "
+    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
+    "Skills that aren't maintained become liabilities."
 )
 
 PLATFORM_HINTS = {
@@ -139,9 +205,21 @@ PLATFORM_HINTS = {
         "is preserved for threading. Do not include greetings or sign-offs unless "
         "contextually appropriate."
     ),
+    "cron": (
+        "You are running as a scheduled cron job. Your final response is automatically "
+        "delivered to the job's configured destination, so do not use send_message to "
+        "send to that same target again. If you want the user to receive something in "
+        "the scheduled destination, put it directly in your final response. Use "
+        "send_message only for additional or different targets."
+    ),
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
         "renderable inside a terminal."
+    ),
+    "sms": (
+        "You are communicating via SMS. Keep responses concise and use plain text "
+        "only — no markdown, no formatting. SMS messages are limited to ~1600 "
+        "characters, so be brief and direct."
     ),
 }
 
@@ -177,7 +255,8 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
                 desc = desc[:57] + "..."
 
         return True, frontmatter, desc
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to parse skill file %s: %s", skill_file, e)
         return True, {}, ""
 
 
@@ -194,7 +273,8 @@ def _read_skill_conditions(skill_file: Path) -> dict:
             "fallback_for_tools": hermes.get("fallback_for_tools", []),
             "requires_tools": hermes.get("requires_tools", []),
         }
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to read skill conditions from %s: %s", skill_file, e)
         return {}
 
 
@@ -315,6 +395,9 @@ def build_skills_system_prompt(
         "Before replying, scan the skills below. If one clearly matches your task, "
         "load it with skill_view(name) and follow its instructions. "
         "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        "After difficult/iterative tasks, offer to save as a skill. "
+        "If a skill you loaded was missing steps, had wrong commands, or needed "
+        "pitfalls you discovered, update it before finishing.\n"
         "\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
@@ -344,7 +427,7 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
     """Discover and load context files for the system prompt.
 
     Discovery: AGENTS.md (recursive), .cursorrules / .cursor/rules/*.mdc,
-    SOUL.md (cwd then ~/.hermes/ fallback). Each capped at 20,000 chars.
+    and SOUL.md from HERMES_HOME only. Each capped at 20,000 chars.
     """
     if cwd is None:
         cwd = os.getcwd()
@@ -412,29 +495,43 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
         cursorrules_content = _truncate_content(cursorrules_content, ".cursorrules")
         sections.append(cursorrules_content)
 
-    # SOUL.md (cwd first, then ~/.hermes/ fallback)
-    soul_path = None
-    for name in ["SOUL.md", "soul.md"]:
-        candidate = cwd_path / name
-        if candidate.exists():
-            soul_path = candidate
-            break
-    if not soul_path:
-        global_soul = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "SOUL.md"
-        if global_soul.exists():
-            soul_path = global_soul
+    # .hermes.md / HERMES.md — per-project agent config (walk to git root)
+    hermes_md_content = ""
+    hermes_md_path = _find_hermes_md(cwd_path)
+    if hermes_md_path:
+        try:
+            content = hermes_md_path.read_text(encoding="utf-8").strip()
+            if content:
+                content = _strip_yaml_frontmatter(content)
+                rel = hermes_md_path.name
+                try:
+                    rel = str(hermes_md_path.relative_to(cwd_path))
+                except ValueError:
+                    pass
+                content = _scan_context_content(content, rel)
+                hermes_md_content = f"## {rel}\n\n{content}"
+        except Exception as e:
+            logger.debug("Could not read %s: %s", hermes_md_path, e)
 
-    if soul_path:
+    if hermes_md_content:
+        hermes_md_content = _truncate_content(hermes_md_content, ".hermes.md")
+        sections.append(hermes_md_content)
+
+    # SOUL.md from HERMES_HOME only
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+
+    soul_path = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "SOUL.md"
+    if soul_path.exists():
         try:
             content = soul_path.read_text(encoding="utf-8").strip()
             if content:
                 content = _scan_context_content(content, "SOUL.md")
                 content = _truncate_content(content, "SOUL.md")
-                sections.append(
-                    f"## SOUL.md\n\nIf SOUL.md is present, embody its persona and tone. "
-                    f"Avoid stiff, generic replies; follow its guidance unless higher-priority "
-                    f"instructions override it.\n\n{content}"
-                )
+                sections.append(content)
         except Exception as e:
             logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
 

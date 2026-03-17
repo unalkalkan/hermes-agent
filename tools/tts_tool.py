@@ -2,10 +2,11 @@
 """
 Text-to-Speech Tool Module
 
-Supports three TTS providers:
+Supports four TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
+- NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -25,35 +26,41 @@ import datetime
 import json
 import logging
 import os
+import queue
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Optional imports -- providers degrade gracefully if not installed
+# Lazy imports -- providers are imported only when actually used to avoid
+# crashing in headless environments (SSH, Docker, WSL, no PortAudio).
 # ---------------------------------------------------------------------------
-try:
+
+def _import_edge_tts():
+    """Lazy import edge_tts. Returns the module or raises ImportError."""
     import edge_tts
-    _HAS_EDGE_TTS = True
-except ImportError:
-    _HAS_EDGE_TTS = False
+    return edge_tts
 
-try:
+def _import_elevenlabs():
+    """Lazy import ElevenLabs client. Returns the class or raises ImportError."""
     from elevenlabs.client import ElevenLabs
-    _HAS_ELEVENLABS = True
-except ImportError:
-    _HAS_ELEVENLABS = False
+    return ElevenLabs
 
-# openai is a core dependency, but guard anyway
-try:
+def _import_openai_client():
+    """Lazy import OpenAI client. Returns the class or raises ImportError."""
     from openai import OpenAI as OpenAIClient
-    _HAS_OPENAI = True
-except ImportError:
-    _HAS_OPENAI = False
+    return OpenAIClient
+
+def _import_sounddevice():
+    """Lazy import sounddevice. Returns the module or raises ImportError/OSError."""
+    import sounddevice as sd
+    return sd
 
 
 # ===========================================================================
@@ -63,6 +70,7 @@ DEFAULT_PROVIDER = "edge"
 DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
 DEFAULT_ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
+DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OUTPUT_DIR = str(Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "audio_cache")
@@ -154,10 +162,11 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     Returns:
         Path to the saved audio file.
     """
+    _edge_tts = _import_edge_tts()
     edge_config = tts_config.get("edge", {})
     voice = edge_config.get("voice", DEFAULT_EDGE_VOICE)
 
-    communicate = edge_tts.Communicate(text, voice)
+    communicate = _edge_tts.Communicate(text, voice)
     await communicate.save(output_path)
     return output_path
 
@@ -191,6 +200,7 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     else:
         output_format = "mp3_44100_128"
 
+    ElevenLabs = _import_elevenlabs()
     client = ElevenLabs(api_key=api_key)
     audio_generator = client.text_to_speech.convert(
         text=text,
@@ -236,6 +246,7 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     else:
         response_format = "mp3"
 
+    OpenAIClient = _import_openai_client()
     client = OpenAIClient(api_key=api_key, base_url="https://api.openai.com/v1")
     response = client.audio.speech.create(
         model=model,
@@ -245,6 +256,82 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     )
 
     response.stream_to_file(output_path)
+    return output_path
+
+
+# ===========================================================================
+# NeuTTS (local, on-device TTS via neutts_cli)
+# ===========================================================================
+
+def _check_neutts_available() -> bool:
+    """Check if the neutts engine is importable (installed locally)."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("neutts") is not None
+    except Exception:
+        return False
+
+
+def _default_neutts_ref_audio() -> str:
+    """Return path to the bundled default voice reference audio."""
+    return str(Path(__file__).parent / "neutts_samples" / "jo.wav")
+
+
+def _default_neutts_ref_text() -> str:
+    """Return path to the bundled default voice reference transcript."""
+    return str(Path(__file__).parent / "neutts_samples" / "jo.txt")
+
+
+def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using the local NeuTTS engine.
+
+    Runs synthesis in a subprocess via tools/neutts_synth.py to keep the
+    ~500MB model in a separate process that exits after synthesis.
+    Outputs WAV; the caller handles conversion for Telegram if needed.
+    """
+    import sys
+
+    neutts_config = tts_config.get("neutts", {})
+    ref_audio = neutts_config.get("ref_audio", "") or _default_neutts_ref_audio()
+    ref_text = neutts_config.get("ref_text", "") or _default_neutts_ref_text()
+    model = neutts_config.get("model", "neuphonic/neutts-air-q4-gguf")
+    device = neutts_config.get("device", "cpu")
+
+    # NeuTTS outputs WAV natively — use a .wav path for generation,
+    # let the caller convert to the final format afterward.
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    synth_script = str(Path(__file__).parent / "neutts_synth.py")
+    cmd = [
+        sys.executable, synth_script,
+        "--text", text,
+        "--out", wav_path,
+        "--ref-audio", ref_audio,
+        "--ref-text", ref_text,
+        "--model", model,
+        "--device", device,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        # Filter out the "OK:" line from stderr
+        error_lines = [l for l in stderr.splitlines() if not l.startswith("OK:")]
+        raise RuntimeError(f"NeuTTS synthesis failed: {chr(10).join(error_lines) or 'unknown error'}")
+
+    # If the caller wanted .mp3 or .ogg, convert from WAV
+    if wav_path != output_path:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            subprocess.run(conv_cmd, check=True, timeout=30)
+            os.remove(wav_path)
+        else:
+            # No ffmpeg — just rename the WAV to the expected path
+            os.rename(wav_path, output_path)
+
     return output_path
 
 
@@ -311,7 +398,9 @@ def text_to_speech_tool(
     try:
         # Generate audio with the configured provider
         if provider == "elevenlabs":
-            if not _HAS_ELEVENLABS:
+            try:
+                _import_elevenlabs()
+            except ImportError:
                 return json.dumps({
                     "success": False,
                     "error": "ElevenLabs provider selected but 'elevenlabs' package not installed. Run: pip install elevenlabs"
@@ -320,7 +409,9 @@ def text_to_speech_tool(
             _generate_elevenlabs(text, file_str, tts_config)
 
         elif provider == "openai":
-            if not _HAS_OPENAI:
+            try:
+                _import_openai_client()
+            except ImportError:
                 return json.dumps({
                     "success": False,
                     "error": "OpenAI provider selected but 'openai' package not installed."
@@ -328,24 +419,45 @@ def text_to_speech_tool(
             logger.info("Generating speech with OpenAI TTS...")
             _generate_openai_tts(text, file_str, tts_config)
 
-        else:
-            # Default: Edge TTS (free)
-            if not _HAS_EDGE_TTS:
+        elif provider == "neutts":
+            if not _check_neutts_available():
                 return json.dumps({
                     "success": False,
-                    "error": "Edge TTS not available. Run: pip install edge-tts"
+                    "error": "NeuTTS provider selected but neutts_cli is not installed. "
+                             "Install the NeuTTS skill and run the bootstrap helper first."
                 }, ensure_ascii=False)
-            logger.info("Generating speech with Edge TTS...")
-            # Edge TTS is async, run it
+            logger.info("Generating speech with NeuTTS (local)...")
+            _generate_neutts(text, file_str, tts_config)
+
+        else:
+            # Default: Edge TTS (free), with NeuTTS as local fallback
+            edge_available = True
             try:
-                loop = asyncio.get_running_loop()
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    pool.submit(
-                        lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                    ).result(timeout=60)
-            except RuntimeError:
-                asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                _import_edge_tts()
+            except ImportError:
+                edge_available = False
+
+            if edge_available:
+                logger.info("Generating speech with Edge TTS...")
+                try:
+                    loop = asyncio.get_running_loop()
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        pool.submit(
+                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                        ).result(timeout=60)
+                except RuntimeError:
+                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+            elif _check_neutts_available():
+                logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
+                provider = "neutts"
+                _generate_neutts(text, file_str, tts_config)
+            else:
+                return json.dumps({
+                    "success": False,
+                    "error": "No TTS provider available. Install edge-tts (pip install edge-tts) "
+                             "or set up NeuTTS for local synthesis."
+                }, ensure_ascii=False)
 
         # Check the file was actually created
         if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
@@ -354,9 +466,10 @@ def text_to_speech_tool(
                 "error": f"TTS generation produced no output (provider: {provider})"
             }, ensure_ascii=False)
 
-        # Try Opus conversion for Telegram compatibility (Edge TTS only outputs MP3)
+        # Try Opus conversion for Telegram compatibility
+        # Edge TTS outputs MP3, NeuTTS outputs WAV — both need ffmpeg conversion
         voice_compatible = False
-        if provider == "edge" and file_str.endswith(".mp3"):
+        if provider in ("edge", "neutts") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
@@ -411,13 +524,262 @@ def check_tts_requirements() -> bool:
     Returns:
         bool: True if at least one provider can work.
     """
-    if _HAS_EDGE_TTS:
+    try:
+        _import_edge_tts()
         return True
-    if _HAS_ELEVENLABS and os.getenv("ELEVENLABS_API_KEY"):
-        return True
-    if _HAS_OPENAI and os.getenv("VOICE_TOOLS_OPENAI_KEY"):
+    except ImportError:
+        pass
+    try:
+        _import_elevenlabs()
+        if os.getenv("ELEVENLABS_API_KEY"):
+            return True
+    except ImportError:
+        pass
+    try:
+        _import_openai_client()
+        if os.getenv("VOICE_TOOLS_OPENAI_KEY"):
+            return True
+    except ImportError:
+        pass
+    if _check_neutts_available():
         return True
     return False
+
+
+# ===========================================================================
+# Streaming TTS: sentence-by-sentence pipeline for ElevenLabs
+# ===========================================================================
+# Sentence boundary pattern: punctuation followed by space or newline
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?])(?:\s|\n)|(?:\n\n)')
+
+# Markdown stripping patterns (same as cli.py _voice_speak_response)
+_MD_CODE_BLOCK = re.compile(r'```[\s\S]*?```')
+_MD_LINK = re.compile(r'\[([^\]]+)\]\([^)]+\)')
+_MD_URL = re.compile(r'https?://\S+')
+_MD_BOLD = re.compile(r'\*\*(.+?)\*\*')
+_MD_ITALIC = re.compile(r'\*(.+?)\*')
+_MD_INLINE_CODE = re.compile(r'`(.+?)`')
+_MD_HEADER = re.compile(r'^#+\s*', flags=re.MULTILINE)
+_MD_LIST_ITEM = re.compile(r'^\s*[-*]\s+', flags=re.MULTILINE)
+_MD_HR = re.compile(r'---+')
+_MD_EXCESS_NL = re.compile(r'\n{3,}')
+
+
+def _strip_markdown_for_tts(text: str) -> str:
+    """Remove markdown formatting that shouldn't be spoken aloud."""
+    text = _MD_CODE_BLOCK.sub(' ', text)
+    text = _MD_LINK.sub(r'\1', text)
+    text = _MD_URL.sub('', text)
+    text = _MD_BOLD.sub(r'\1', text)
+    text = _MD_ITALIC.sub(r'\1', text)
+    text = _MD_INLINE_CODE.sub(r'\1', text)
+    text = _MD_HEADER.sub('', text)
+    text = _MD_LIST_ITEM.sub('', text)
+    text = _MD_HR.sub('', text)
+    text = _MD_EXCESS_NL.sub('\n\n', text)
+    return text.strip()
+
+
+def stream_tts_to_speaker(
+    text_queue: queue.Queue,
+    stop_event: threading.Event,
+    tts_done_event: threading.Event,
+    display_callback: Optional[Callable[[str], None]] = None,
+):
+    """Consume text deltas from *text_queue*, buffer them into sentences,
+    and stream each sentence through ElevenLabs TTS to the speaker in
+    real-time.
+
+    Protocol:
+        * The producer puts ``str`` deltas onto *text_queue*.
+        * A ``None`` sentinel signals end-of-text (flush remaining buffer).
+        * *stop_event* can be set to abort early (e.g. user interrupt).
+        * *tts_done_event* is **set** in the ``finally`` block so callers
+          waiting on it (continuous voice mode) know playback is finished.
+    """
+    tts_done_event.clear()
+
+    try:
+        # --- TTS client setup (optional -- display_callback works without it) ---
+        client = None
+        output_stream = None
+        voice_id = DEFAULT_ELEVENLABS_VOICE_ID
+        model_id = DEFAULT_ELEVENLABS_STREAMING_MODEL_ID
+
+        tts_config = _load_tts_config()
+        el_config = tts_config.get("elevenlabs", {})
+        voice_id = el_config.get("voice_id", voice_id)
+        model_id = el_config.get("streaming_model_id",
+                                 el_config.get("model_id", model_id))
+
+        api_key = os.getenv("ELEVENLABS_API_KEY", "")
+        if not api_key:
+            logger.warning("ELEVENLABS_API_KEY not set; streaming TTS audio disabled")
+        else:
+            try:
+                ElevenLabs = _import_elevenlabs()
+                client = ElevenLabs(api_key=api_key)
+            except ImportError:
+                logger.warning("elevenlabs package not installed; streaming TTS disabled")
+
+            # Open a single sounddevice output stream for the lifetime of
+            # this function.  ElevenLabs pcm_24000 produces signed 16-bit
+            # little-endian mono PCM at 24 kHz.
+            if client is not None:
+                try:
+                    sd = _import_sounddevice()
+                    import numpy as _np
+                    output_stream = sd.OutputStream(
+                        samplerate=24000, channels=1, dtype="int16",
+                    )
+                    output_stream.start()
+                except (ImportError, OSError) as exc:
+                    logger.debug("sounddevice not available: %s", exc)
+                    output_stream = None
+                except Exception as exc:
+                    logger.warning("sounddevice OutputStream failed: %s", exc)
+                    output_stream = None
+
+        sentence_buf = ""
+        min_sentence_len = 20
+        long_flush_len = 100
+        queue_timeout = 0.5
+        _spoken_sentences: list[str] = []  # track spoken sentences to skip duplicates
+        # Regex to strip complete <think>...</think> blocks from buffer
+        _think_block_re = re.compile(r'<think[\s>].*?</think>', flags=re.DOTALL)
+
+        def _speak_sentence(sentence: str):
+            """Display sentence and optionally generate + play audio."""
+            if stop_event.is_set():
+                return
+            cleaned = _strip_markdown_for_tts(sentence).strip()
+            if not cleaned:
+                return
+            # Skip duplicate/near-duplicate sentences (LLM repetition)
+            cleaned_lower = cleaned.lower().rstrip(".!,")
+            for prev in _spoken_sentences:
+                if prev.lower().rstrip(".!,") == cleaned_lower:
+                    return
+            _spoken_sentences.append(cleaned)
+            # Display raw sentence on screen before TTS processing
+            if display_callback is not None:
+                display_callback(sentence)
+            # Skip audio generation if no TTS client available
+            if client is None:
+                return
+            # Truncate very long sentences
+            if len(cleaned) > MAX_TEXT_LENGTH:
+                cleaned = cleaned[:MAX_TEXT_LENGTH]
+            try:
+                audio_iter = client.text_to_speech.convert(
+                    text=cleaned,
+                    voice_id=voice_id,
+                    model_id=model_id,
+                    output_format="pcm_24000",
+                )
+                if output_stream is not None:
+                    for chunk in audio_iter:
+                        if stop_event.is_set():
+                            break
+                        import numpy as _np
+                        audio_array = _np.frombuffer(chunk, dtype=_np.int16)
+                        output_stream.write(audio_array.reshape(-1, 1))
+                else:
+                    # Fallback: write chunks to temp file and play via system player
+                    _play_via_tempfile(audio_iter, stop_event)
+            except Exception as exc:
+                logger.warning("Streaming TTS sentence failed: %s", exc)
+
+        def _play_via_tempfile(audio_iter, stop_evt):
+            """Write PCM chunks to a temp WAV file and play it."""
+            tmp_path = None
+            try:
+                import wave
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                with wave.open(tmp, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)  # 16-bit
+                    wf.setframerate(24000)
+                    for chunk in audio_iter:
+                        if stop_evt.is_set():
+                            break
+                        wf.writeframes(chunk)
+                from tools.voice_mode import play_audio_file
+                play_audio_file(tmp_path)
+            except Exception as exc:
+                logger.warning("Temp-file TTS fallback failed: %s", exc)
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        while not stop_event.is_set():
+            # Read next delta from queue
+            try:
+                delta = text_queue.get(timeout=queue_timeout)
+            except queue.Empty:
+                # Timeout: if we have accumulated a long buffer, flush it
+                if len(sentence_buf) > long_flush_len:
+                    _speak_sentence(sentence_buf)
+                    sentence_buf = ""
+                continue
+
+            if delta is None:
+                # End-of-text sentinel: strip any remaining think blocks, flush
+                sentence_buf = _think_block_re.sub('', sentence_buf)
+                if sentence_buf.strip():
+                    _speak_sentence(sentence_buf)
+                break
+
+            sentence_buf += delta
+
+            # --- Think block filtering ---
+            # Strip complete <think>...</think> blocks from buffer.
+            # Works correctly even when tags span multiple deltas.
+            sentence_buf = _think_block_re.sub('', sentence_buf)
+
+            # If an incomplete <think tag is at the end, wait for more data
+            # before extracting sentences (the closing tag may arrive next).
+            if '<think' in sentence_buf and '</think>' not in sentence_buf:
+                continue
+
+            # Check for sentence boundaries
+            while True:
+                m = _SENTENCE_BOUNDARY_RE.search(sentence_buf)
+                if m is None:
+                    break
+                end_pos = m.end()
+                sentence = sentence_buf[:end_pos]
+                sentence_buf = sentence_buf[end_pos:]
+                # Merge short fragments into the next sentence
+                if len(sentence.strip()) < min_sentence_len:
+                    sentence_buf = sentence + sentence_buf
+                    break
+                _speak_sentence(sentence)
+
+        # Drain any remaining items from the queue
+        while True:
+            try:
+                text_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # output_stream is closed in the finally block below
+
+    except Exception as exc:
+        logger.warning("Streaming TTS pipeline error: %s", exc)
+    finally:
+        # Always close the audio output stream to avoid locking the device
+        if output_stream is not None:
+            try:
+                output_stream.stop()
+                output_stream.close()
+            except Exception:
+                pass
+        tts_done_event.set()
 
 
 # ===========================================================================
@@ -427,12 +789,19 @@ if __name__ == "__main__":
     print("🔊 Text-to-Speech Tool Module")
     print("=" * 50)
 
+    def _check(importer, label):
+        try:
+            importer()
+            return True
+        except ImportError:
+            return False
+
     print(f"\nProvider availability:")
-    print(f"  Edge TTS:   {'✅ installed' if _HAS_EDGE_TTS else '❌ not installed (pip install edge-tts)'}")
-    print(f"  ElevenLabs: {'✅ installed' if _HAS_ELEVENLABS else '❌ not installed (pip install elevenlabs)'}")
-    print(f"    API Key:  {'✅ set' if os.getenv('ELEVENLABS_API_KEY') else '❌ not set'}")
-    print(f"  OpenAI:     {'✅ installed' if _HAS_OPENAI else '❌ not installed'}")
-    print(f"    API Key:  {'✅ set' if os.getenv('VOICE_TOOLS_OPENAI_KEY') else '❌ not set (VOICE_TOOLS_OPENAI_KEY)'}")
+    print(f"  Edge TTS:   {'installed' if _check(_import_edge_tts, 'edge') else 'not installed (pip install edge-tts)'}")
+    print(f"  ElevenLabs: {'installed' if _check(_import_elevenlabs, 'el') else 'not installed (pip install elevenlabs)'}")
+    print(f"    API Key:  {'set' if os.getenv('ELEVENLABS_API_KEY') else 'not set'}")
+    print(f"  OpenAI:     {'installed' if _check(_import_openai_client, 'oai') else 'not installed'}")
+    print(f"    API Key:  {'set' if os.getenv('VOICE_TOOLS_OPENAI_KEY') else 'not set (VOICE_TOOLS_OPENAI_KEY)'}")
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
     print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
 
@@ -473,4 +842,5 @@ registry.register(
         text=args.get("text", ""),
         output_path=args.get("output_path")),
     check_fn=check_tts_requirements,
+    emoji="🔊",
 )

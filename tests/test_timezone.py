@@ -241,7 +241,7 @@ class TestCronTimezone:
         job = create_job(prompt="Test job", schedule="every 1h")
         jobs = load_jobs()
         # Force a naive (no timezone) past timestamp
-        naive_past = (datetime.now() - timedelta(minutes=5)).isoformat()
+        naive_past = (datetime.now() - timedelta(seconds=30)).isoformat()
         jobs[0]["next_run_at"] = naive_past
         save_jobs(jobs)
 
@@ -318,7 +318,7 @@ class TestCronTimezone:
 
         # Simulate a naive timestamp that was written by datetime.now() on a
         # system running in UTC+5:30 — 5 minutes in the past (local time)
-        naive_past = (datetime.now() - timedelta(minutes=5)).isoformat()
+        naive_past = (datetime.now() - timedelta(seconds=30)).isoformat()
         jobs[0]["next_run_at"] = naive_past
         save_jobs(jobs)
 
@@ -326,6 +326,34 @@ class TestCronTimezone:
         due = get_due_jobs()
         assert len(due) == 1, (
             "Overdue job was skipped — _ensure_aware likely shifted absolute time"
+        )
+
+    def test_get_due_jobs_naive_cross_timezone(self, tmp_path, monkeypatch):
+        """Naive past timestamps must be detected as due even when Hermes tz
+        is behind system local tz — the scenario that triggered #806."""
+        import cron.jobs as jobs_module
+        monkeypatch.setattr(jobs_module, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(jobs_module, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(jobs_module, "OUTPUT_DIR", tmp_path / "cron" / "output")
+
+        # Use a Hermes timezone far behind UTC so that the numeric wall time
+        # of the naive timestamp exceeds _hermes_now's wall time — this would
+        # have caused a false "not due" with the old replace(tzinfo=...) approach.
+        os.environ["HERMES_TIMEZONE"] = "Pacific/Midway"  # UTC-11
+        hermes_time.reset_cache()
+
+        from cron.jobs import create_job, load_jobs, save_jobs, get_due_jobs
+        create_job(prompt="Cross-tz job", schedule="every 1h")
+        jobs = load_jobs()
+
+        # Force a naive past timestamp (system-local wall time, 10 min ago)
+        naive_past = (datetime.now() - timedelta(seconds=30)).isoformat()
+        jobs[0]["next_run_at"] = naive_past
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert len(due) == 1, (
+            "Naive past timestamp should be due regardless of Hermes timezone"
         )
 
     def test_create_job_stores_tz_aware_timestamps(self, tmp_path, monkeypatch):

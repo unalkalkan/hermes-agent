@@ -9,11 +9,16 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
+_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
+_VOICE_EXTS = {".ogg", ".opus"}
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -120,6 +125,7 @@ def _handle_send(args):
         "whatsapp": Platform.WHATSAPP,
         "signal": Platform.SIGNAL,
         "email": Platform.EMAIL,
+        "sms": Platform.SMS,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -129,6 +135,11 @@ def _handle_send(args):
     pconfig = config.platforms.get(platform)
     if not pconfig or not pconfig.enabled:
         return json.dumps({"error": f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/gateway.json or environment variables."})
+
+    from gateway.platforms.base import BasePlatformAdapter
+
+    media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+    mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
     if not chat_id:
@@ -143,18 +154,31 @@ def _handle_send(args):
                 f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
             })
 
+    duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
+    if duplicate_skip:
+        return json.dumps(duplicate_skip)
+
     try:
         from model_tools import _run_async
-        result = _run_async(_send_to_platform(platform, pconfig, chat_id, message, thread_id=thread_id))
+        result = _run_async(
+            _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_message,
+                thread_id=thread_id,
+                media_files=media_files,
+            )
+        )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
         # Mirror the sent message into the target's gateway session
-        if isinstance(result, dict) and result.get("success"):
+        if isinstance(result, dict) and result.get("success") and mirror_text:
             try:
                 from gateway.mirror import mirror_to_session
                 source_label = os.getenv("HERMES_SESSION_PLATFORM", "cli")
-                if mirror_to_session(platform_name, chat_id, message, source_label=source_label, thread_id=thread_id):
+                if mirror_to_session(platform_name, chat_id, mirror_text, source_label=source_label, thread_id=thread_id):
                     result["mirrored"] = True
             except Exception:
                 pass
@@ -175,32 +199,273 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     return None, None, False
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None):
-    """Route a message to the appropriate platform sender."""
+def _describe_media_for_mirror(media_files):
+    """Return a human-readable mirror summary when a message only contains media."""
+    if not media_files:
+        return ""
+    if len(media_files) == 1:
+        media_path, is_voice = media_files[0]
+        ext = os.path.splitext(media_path)[1].lower()
+        if is_voice and ext in _VOICE_EXTS:
+            return "[Sent voice message]"
+        if ext in _IMAGE_EXTS:
+            return "[Sent image attachment]"
+        if ext in _VIDEO_EXTS:
+            return "[Sent video attachment]"
+        if ext in _AUDIO_EXTS:
+            return "[Sent audio attachment]"
+        return "[Sent document attachment]"
+    return f"[Sent {len(media_files)} media attachments]"
+
+
+def _get_cron_auto_delivery_target():
+    """Return the cron scheduler's auto-delivery target for the current run, if any."""
+    platform = os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
+    chat_id = os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+    if not platform or not chat_id:
+        return None
+    thread_id = os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+    }
+
+
+def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
+    """Skip redundant cron send_message calls when the scheduler will auto-deliver there."""
+    auto_target = _get_cron_auto_delivery_target()
+    if not auto_target:
+        return None
+
+    same_target = (
+        auto_target["platform"] == platform_name
+        and str(auto_target["chat_id"]) == str(chat_id)
+        and auto_target.get("thread_id") == thread_id
+    )
+    if not same_target:
+        return None
+
+    target_label = f"{platform_name}:{chat_id}"
+    if thread_id is not None:
+        target_label += f":{thread_id}"
+
+    return {
+        "success": True,
+        "skipped": True,
+        "reason": "cron_auto_delivery_duplicate_target",
+        "target": target_label,
+        "note": (
+            f"Skipped send_message to {target_label}. This cron job will already auto-deliver "
+            "its final response to that same target. Put the intended user-facing content in "
+            "your final response instead, or use a different target if you want an additional message."
+        ),
+    }
+
+
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+    """Route a message to the appropriate platform sender.
+
+    Long messages are automatically chunked to fit within platform limits
+    using the same smart-splitting algorithm as the gateway adapters
+    (preserves code-block boundaries, adds part indicators).
+    """
     from gateway.config import Platform
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.platforms.telegram import TelegramAdapter
+    from gateway.platforms.discord import DiscordAdapter
+    from gateway.platforms.slack import SlackAdapter
+
+    media_files = media_files or []
+
+    # Platform message length limits (from adapter class attributes)
+    _MAX_LENGTHS = {
+        Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
+        Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
+        Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
+    }
+
+    # Smart-chunk the message to fit within platform limits.
+    # For short messages or platforms without a known limit this is a no-op.
+    max_len = _MAX_LENGTHS.get(platform)
+    if max_len:
+        chunks = BasePlatformAdapter.truncate_message(message, max_len)
+    else:
+        chunks = [message]
+
+    # --- Telegram: special handling for media attachments ---
     if platform == Platform.TELEGRAM:
-        return await _send_telegram(pconfig.token, chat_id, message, thread_id=thread_id)
-    elif platform == Platform.DISCORD:
-        return await _send_discord(pconfig.token, chat_id, message)
-    elif platform == Platform.SLACK:
-        return await _send_slack(pconfig.token, chat_id, message)
-    elif platform == Platform.SIGNAL:
-        return await _send_signal(pconfig.extra, chat_id, message)
-    elif platform == Platform.EMAIL:
-        return await _send_email(pconfig.extra, chat_id, message)
-    return {"error": f"Direct sending not yet implemented for {platform.value}"}
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_telegram(
+                pconfig.token,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+                thread_id=thread_id,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
+    # --- Non-Telegram platforms ---
+    if media_files and not message.strip():
+        return {
+            "error": (
+                f"send_message MEDIA delivery is currently only supported for telegram; "
+                f"target {platform.value} had only media attachments"
+            )
+        }
+    warning = None
+    if media_files:
+        warning = (
+            f"MEDIA attachments were omitted for {platform.value}; "
+            "native send_message media delivery is currently only supported for telegram"
+        )
+
+    last_result = None
+    for chunk in chunks:
+        if platform == Platform.DISCORD:
+            result = await _send_discord(pconfig.token, chat_id, chunk)
+        elif platform == Platform.SLACK:
+            result = await _send_slack(pconfig.token, chat_id, chunk)
+        elif platform == Platform.SIGNAL:
+            result = await _send_signal(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.EMAIL:
+            result = await _send_email(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.SMS:
+            result = await _send_sms(pconfig.api_key, chat_id, chunk)
+        else:
+            result = {"error": f"Direct sending not yet implemented for {platform.value}"}
+
+        if isinstance(result, dict) and result.get("error"):
+            return result
+        last_result = result
+
+    if warning and isinstance(last_result, dict) and last_result.get("success"):
+        warnings = list(last_result.get("warnings", []))
+        warnings.append(warning)
+        last_result["warnings"] = warnings
+    return last_result
 
 
-async def _send_telegram(token, chat_id, message, thread_id=None):
-    """Send via Telegram Bot API (one-shot, no polling needed)."""
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None):
+    """Send via Telegram Bot API (one-shot, no polling needed).
+
+    Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
+    so that bold, links, and headers render correctly.  If the message
+    already contains HTML tags, it is sent with ``parse_mode='HTML'``
+    instead, bypassing MarkdownV2 conversion.
+    """
     try:
         from telegram import Bot
+        from telegram.constants import ParseMode
+
+        # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
+        # Inspired by github.com/ashaney — PR #1568.
+        _has_html = bool(re.search(r'<[a-zA-Z/][^>]*>', message))
+
+        if _has_html:
+            formatted = message
+            send_parse_mode = ParseMode.HTML
+        else:
+            # Reuse the gateway adapter's format_message for markdown→MarkdownV2
+            try:
+                from gateway.platforms.telegram import TelegramAdapter, _escape_mdv2, _strip_mdv2
+                _adapter = TelegramAdapter.__new__(TelegramAdapter)
+                formatted = _adapter.format_message(message)
+            except Exception:
+                # Fallback: send as-is if formatting unavailable
+                formatted = message
+            send_parse_mode = ParseMode.MARKDOWN_V2
+
         bot = Bot(token=token)
-        send_kwargs = {"chat_id": int(chat_id), "text": message}
+        int_chat_id = int(chat_id)
+        media_files = media_files or []
+        thread_kwargs = {}
         if thread_id is not None:
-            send_kwargs["message_thread_id"] = int(thread_id)
-        msg = await bot.send_message(**send_kwargs)
-        return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(msg.message_id)}
+            thread_kwargs["message_thread_id"] = int(thread_id)
+
+        last_msg = None
+        warnings = []
+
+        if formatted.strip():
+            try:
+                last_msg = await bot.send_message(
+                    chat_id=int_chat_id, text=formatted,
+                    parse_mode=send_parse_mode, **thread_kwargs
+                )
+            except Exception as md_error:
+                # Parse failed, fall back to plain text
+                if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
+                    logger.warning("Parse mode %s failed in _send_telegram, falling back to plain text: %s", send_parse_mode, md_error)
+                    if not _has_html:
+                        try:
+                            from gateway.platforms.telegram import _strip_mdv2
+                            plain = _strip_mdv2(formatted)
+                        except Exception:
+                            plain = message
+                    else:
+                        plain = message
+                    last_msg = await bot.send_message(
+                        chat_id=int_chat_id, text=plain,
+                        parse_mode=None, **thread_kwargs
+                    )
+                else:
+                    raise
+
+        for media_path, is_voice in media_files:
+            if not os.path.exists(media_path):
+                warning = f"Media file not found, skipping: {media_path}"
+                logger.warning(warning)
+                warnings.append(warning)
+                continue
+
+            ext = os.path.splitext(media_path)[1].lower()
+            try:
+                with open(media_path, "rb") as f:
+                    if ext in _IMAGE_EXTS:
+                        last_msg = await bot.send_photo(
+                            chat_id=int_chat_id, photo=f, **thread_kwargs
+                        )
+                    elif ext in _VIDEO_EXTS:
+                        last_msg = await bot.send_video(
+                            chat_id=int_chat_id, video=f, **thread_kwargs
+                        )
+                    elif ext in _VOICE_EXTS and is_voice:
+                        last_msg = await bot.send_voice(
+                            chat_id=int_chat_id, voice=f, **thread_kwargs
+                        )
+                    elif ext in _AUDIO_EXTS:
+                        last_msg = await bot.send_audio(
+                            chat_id=int_chat_id, audio=f, **thread_kwargs
+                        )
+                    else:
+                        last_msg = await bot.send_document(
+                            chat_id=int_chat_id, document=f, **thread_kwargs
+                        )
+            except Exception as e:
+                warning = f"Failed to send media {media_path}: {e}"
+                logger.error(warning)
+                warnings.append(warning)
+
+        if last_msg is None:
+            error = "No deliverable text or media remained after processing MEDIA tags"
+            if warnings:
+                return {"error": error, "warnings": warnings}
+            return {"error": error}
+
+        result = {
+            "success": True,
+            "platform": "telegram",
+            "chat_id": chat_id,
+            "message_id": str(last_msg.message_id),
+        }
+        if warnings:
+            result["warnings"] = warnings
+        return result
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
@@ -208,7 +473,10 @@ async def _send_telegram(token, chat_id, message, thread_id=None):
 
 
 async def _send_discord(token, chat_id, message):
-    """Send via Discord REST API (no websocket client needed)."""
+    """Send a single message via Discord REST API (no websocket client needed).
+
+    Chunking is handled by _send_to_platform() before this is called.
+    """
     try:
         import aiohttp
     except ImportError:
@@ -216,17 +484,13 @@ async def _send_discord(token, chat_id, message):
     try:
         url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-        chunks = [message[i:i+2000] for i in range(0, len(message), 2000)]
-        message_ids = []
         async with aiohttp.ClientSession() as session:
-            for chunk in chunks:
-                async with session.post(url, headers=headers, json={"content": chunk}) as resp:
-                    if resp.status not in (200, 201):
-                        body = await resp.text()
-                        return {"error": f"Discord API error ({resp.status}): {body}"}
-                    data = await resp.json()
-                    message_ids.append(data.get("id"))
-        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_ids": message_ids}
+            async with session.post(url, headers=headers, json={"content": message}) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    return {"error": f"Discord API error ({resp.status}): {body}"}
+                data = await resp.json()
+        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": data.get("id")}
     except Exception as e:
         return {"error": f"Discord send failed: {e}"}
 
@@ -306,13 +570,66 @@ async def _send_email(extra, chat_id, message):
         msg["Subject"] = "Hermes Agent"
 
         server = smtplib.SMTP(smtp_host, smtp_port)
-        server.starttls()
+        server.starttls(context=ssl.create_default_context())
         server.login(address, password)
         server.send_message(msg)
         server.quit()
         return {"success": True, "platform": "email", "chat_id": chat_id}
     except Exception as e:
         return {"error": f"Email send failed: {e}"}
+
+
+async def _send_sms(auth_token, chat_id, message):
+    """Send a single SMS via Twilio REST API.
+
+    Uses HTTP Basic auth (Account SID : Auth Token) and form-encoded POST.
+    Chunking is handled by _send_to_platform() before this is called.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    import base64
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER", "")
+    if not account_sid or not auth_token or not from_number:
+        return {"error": "SMS not configured (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER required)"}
+
+    # Strip markdown — SMS renders it as literal characters
+    message = re.sub(r"\*\*(.+?)\*\*", r"\1", message, flags=re.DOTALL)
+    message = re.sub(r"\*(.+?)\*", r"\1", message, flags=re.DOTALL)
+    message = re.sub(r"__(.+?)__", r"\1", message, flags=re.DOTALL)
+    message = re.sub(r"_(.+?)_", r"\1", message, flags=re.DOTALL)
+    message = re.sub(r"```[a-z]*\n?", "", message)
+    message = re.sub(r"`(.+?)`", r"\1", message)
+    message = re.sub(r"^#{1,6}\s+", "", message, flags=re.MULTILINE)
+    message = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", message)
+    message = re.sub(r"\n{3,}", "\n\n", message)
+    message = message.strip()
+
+    try:
+        creds = f"{account_sid}:{auth_token}"
+        encoded = base64.b64encode(creds.encode("ascii")).decode("ascii")
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+        headers = {"Authorization": f"Basic {encoded}"}
+
+        async with aiohttp.ClientSession() as session:
+            form_data = aiohttp.FormData()
+            form_data.add_field("From", from_number)
+            form_data.add_field("To", chat_id)
+            form_data.add_field("Body", message)
+
+            async with session.post(url, data=form_data, headers=headers) as resp:
+                body = await resp.json()
+                if resp.status >= 400:
+                    error_msg = body.get("message", str(body))
+                    return {"error": f"Twilio API error ({resp.status}): {error_msg}"}
+                msg_sid = body.get("sid", "")
+                return {"success": True, "platform": "sms", "chat_id": chat_id, "message_id": msg_sid}
+    except Exception as e:
+        return {"error": f"SMS send failed: {e}"}
 
 
 def _check_send_message():
@@ -336,4 +653,5 @@ registry.register(
     schema=SEND_MESSAGE_SCHEMA,
     handler=send_message_tool,
     check_fn=_check_send_message,
+    emoji="📨",
 )
