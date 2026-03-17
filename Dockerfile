@@ -1,33 +1,49 @@
 # ============================================================================
-# Hermes Agent — Docker Image (Debian Bookworm + Docker-in-Docker)
+# Hermes Agent — Docker Image (NVIDIA CUDA + Docker-in-Docker)
 # ============================================================================
 # Build:  docker compose build
 # Run:    docker compose up -d
 # Shell:  docker compose exec hermes bash
 # Chat:   docker compose exec hermes hermes
 # Setup:  docker compose exec hermes hermes setup
+#
+# GPU:    Requires NVIDIA drivers + nvidia-container-toolkit on host.
+#         Override CUDA version at build time:
+#           docker compose build --build-arg CUDA_BASE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
 # ============================================================================
+
+# ── Build arg for CUDA base image (must be before any FROM) ──────────────────
+ARG CUDA_BASE=nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 
 FROM docker:27-dind AS dind
 
 # ---------------------------------------------------------------------------
-# Main image — Debian Bookworm
+# Main image — NVIDIA CUDA runtime (Ubuntu 22.04 base)
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim
+# Adapt the base image to match your GPU / driver:
+#   RTX 30xx/40xx  → 12.4, 12.6, or 12.8
+#   RTX 50xx       → 12.8 or 13.0 (when available)
+# Fall back to the newest CUDA runtime your driver supports.
+FROM ${CUDA_BASE}
 
 # Avoid interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Make NVIDIA runtime visible inside the container
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # ── System packages ──────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         # Essentials
         ca-certificates curl wget git openssh-client gnupg lsb-release \
-        # Build tools (needed by some Python C-extension wheels)
+        # Build tools (needed by some Python C-extension wheels + flash-attn)
         build-essential python3-dev libffi-dev \
         # Useful CLI utilities
         ripgrep jq less procps vim-tiny \
-        # ffmpeg for TTS voice messages
-        ffmpeg \
+        # Audio / TTS
+        ffmpeg sox libsndfile1 \
         # iptables for Docker-in-Docker networking
         iptables \
         # supervisor for managing dockerd alongside our entrypoint
