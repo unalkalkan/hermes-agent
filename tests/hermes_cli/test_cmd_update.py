@@ -105,3 +105,55 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 0
+
+
+
+def test_update_merges_upstream_and_pushes_origin(monkeypatch, tmp_path, capsys):
+    from hermes_cli import config as hermes_config
+    from hermes_cli import main as hermes_main
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
+    monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)
+    monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
+    monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
+    monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
+    monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    recorded = []
+
+    def fake_run(cmd, **kwargs):
+        recorded.append(cmd)
+        if cmd == ["git", "fetch", "origin"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+        if cmd == ["git", "rev-parse", "--verify", "origin/main"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="origin/main\n", stderr="")
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+        if cmd == ["git", "remote", "get-url", "upstream"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/NousResearch/hermes-agent.git\n", stderr="")
+        if cmd == ["git", "fetch", "upstream"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd == ["git", "rev-parse", "--verify", "upstream/main"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="upstream/main\n", stderr="")
+        if cmd == ["git", "rev-list", "HEAD..upstream/main", "--count"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="2\n", stderr="")
+        if cmd == ["git", "merge", "--no-ff", "upstream/main", "-m", "Merge upstream/main into main"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="merged\n", stderr="")
+        if cmd == ["git", "push", "origin", "main"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="pushed\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    commands = [" ".join(str(a) for a in cmd) for cmd in recorded]
+    assert any(cmd == "git fetch upstream" for cmd in commands)
+    assert any(cmd == "git merge --no-ff upstream/main -m Merge upstream/main into main" for cmd in commands)
+    assert any(cmd == "git push origin main" for cmd in commands)
+

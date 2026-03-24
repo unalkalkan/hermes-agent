@@ -2644,6 +2644,39 @@ def _invalidate_update_cache():
     except Exception:
         pass
 
+
+def _git_remote_exists(git_cmd, cwd, remote_name):
+    """Return True when the git remote exists."""
+    result = subprocess.run(
+        git_cmd + ["remote", "get-url", remote_name],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and bool((getattr(result, "stdout", "") or "").strip())
+
+
+def _git_ref_exists(git_cmd, cwd, ref_name):
+    """Return True when the git ref exists."""
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", ref_name],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and bool((getattr(result, "stdout", "") or "").strip())
+
+
+def _resolve_upstream_ref(git_cmd, cwd, branch):
+    """Resolve the best upstream ref to merge for the current branch."""
+    preferred_ref = f"upstream/{branch}"
+    if _git_ref_exists(git_cmd, cwd, preferred_ref):
+        return preferred_ref
+    fallback_ref = "upstream/main"
+    if preferred_ref != fallback_ref and _git_ref_exists(git_cmd, cwd, fallback_ref):
+        return fallback_ref
+    return None
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version."""
     import shutil
@@ -2704,7 +2737,7 @@ def cmd_update(args):
         if verify.returncode != 0:
             branch = "main"
 
-        # Check if there are updates
+        # Check our fork first.
         result = subprocess.run(
             git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
             cwd=PROJECT_ROOT,
@@ -2712,21 +2745,50 @@ def cmd_update(args):
             text=True,
             check=True
         )
-        commit_count = int(result.stdout.strip())
-        
-        if commit_count == 0:
+        origin_commit_count = int(result.stdout.strip())
+
+        upstream_ref = None
+        upstream_commit_count = 0
+        if _git_remote_exists(git_cmd, PROJECT_ROOT, "upstream"):
+            subprocess.run(git_cmd + ["fetch", "upstream"], cwd=PROJECT_ROOT, check=True)
+            upstream_ref = _resolve_upstream_ref(git_cmd, PROJECT_ROOT, branch)
+            if upstream_ref:
+                result = subprocess.run(
+                    git_cmd + ["rev-list", f"HEAD..{upstream_ref}", "--count"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                upstream_commit_count = int(result.stdout.strip())
+
+        if origin_commit_count == 0 and upstream_commit_count == 0:
             _invalidate_update_cache()
             print("✓ Already up to date!")
             return
-        
-        print(f"→ Found {commit_count} new commit(s)")
+
+        if origin_commit_count:
+            print(f"→ Found {origin_commit_count} new commit(s) in origin/{branch}")
+        if upstream_commit_count:
+            print(f"→ Found {upstream_commit_count} new commit(s) in {upstream_ref}")
 
         auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
         prompt_for_restore = auto_stash_ref is not None and sys.stdin.isatty() and sys.stdout.isatty()
 
-        print("→ Pulling updates...")
         try:
-            subprocess.run(git_cmd + ["pull", "--ff-only", "origin", branch], cwd=PROJECT_ROOT, check=True)
+            if origin_commit_count:
+                print("→ Pulling updates from origin...")
+                subprocess.run(git_cmd + ["pull", "--ff-only", "origin", branch], cwd=PROJECT_ROOT, check=True)
+
+            if upstream_commit_count and upstream_ref:
+                print(f"→ Merging updates from {upstream_ref} into {branch}...")
+                subprocess.run(
+                    git_cmd + ["merge", "--no-ff", upstream_ref, "-m", f"Merge {upstream_ref} into {branch}"],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                )
+                print(f"→ Pushing merged changes to origin/{branch}...")
+                subprocess.run(git_cmd + ["push", "origin", branch], cwd=PROJECT_ROOT, check=True)
         finally:
             if auto_stash_ref is not None:
                 _restore_stashed_changes(
@@ -2735,9 +2797,9 @@ def cmd_update(args):
                     auto_stash_ref,
                     prompt_user=prompt_for_restore,
                 )
-        
+
         _invalidate_update_cache()
-        
+
         # Reinstall Python dependencies (try .[all] first for optional extras,
         # fall back to . if extras fail — mirrors the install script behavior)
         print("→ Updating Python dependencies...")
