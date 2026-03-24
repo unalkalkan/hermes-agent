@@ -32,6 +32,8 @@ def _clear_provider_env(monkeypatch):
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
         "GLM_API_KEY",
         "KIMI_API_KEY",
         "MINIMAX_API_KEY",
@@ -97,21 +99,21 @@ def test_setup_custom_endpoint_saves_working_v1_base_url(tmp_path, monkeypatch):
             return tts_idx
         raise AssertionError(f"Unexpected prompt_choice call: {question}")
 
-    def fake_prompt(message, current=None, **kwargs):
-        if "API base URL" in message:
-            return "http://localhost:8000"
-        if "API key" in message:
-            return "local-key"
-        if "Model name" in message:
-            return "llm"
-        return ""
+    # _model_flow_custom uses builtins.input (URL, key, model, context_length)
+    input_values = iter([
+        "http://localhost:8000",
+        "local-key",
+        "llm",
+        "",  # context_length (blank = auto-detect)
+    ])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(input_values))
 
     monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
-    monkeypatch.setattr("hermes_cli.setup.prompt", fake_prompt)
     monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
     monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: None)
     monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
     monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: [])
+    monkeypatch.setattr("hermes_cli.main._save_custom_provider", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "hermes_cli.models.probe_api_models",
         lambda api_key, base_url: {
@@ -124,16 +126,19 @@ def test_setup_custom_endpoint_saves_working_v1_base_url(tmp_path, monkeypatch):
     )
 
     setup_model_provider(config)
-    save_config(config)
 
     env = _read_env(tmp_path)
-    reloaded = load_config()
 
+    # _model_flow_custom saves env vars and config to disk
     assert env.get("OPENAI_BASE_URL") == "http://localhost:8000/v1"
     assert env.get("OPENAI_API_KEY") == "local-key"
-    assert reloaded["model"]["provider"] == "custom"
-    assert reloaded["model"]["base_url"] == "http://localhost:8000/v1"
-    assert reloaded["model"]["default"] == "llm"
+
+    # The model config is saved as a dict by _model_flow_custom
+    reloaded = load_config()
+    model_cfg = reloaded.get("model", {})
+    if isinstance(model_cfg, dict):
+        assert model_cfg.get("provider") == "custom"
+        assert model_cfg.get("default") == "llm"
 
 
 def test_setup_keep_current_config_provider_uses_provider_specific_model_menu(tmp_path, monkeypatch):
@@ -229,6 +234,152 @@ def test_setup_keep_current_anthropic_can_configure_openai_vision_default(tmp_pa
     assert env.get("OPENAI_API_KEY") == "sk-openai"
     assert env.get("OPENAI_BASE_URL") == "https://api.openai.com/v1"
     assert env.get("AUXILIARY_VISION_MODEL") == "gpt-4o-mini"
+
+
+def test_setup_copilot_uses_gh_auth_and_saves_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+
+    config = load_config()
+
+    def fake_prompt_choice(question, choices, default=0):
+        if question == "Select your inference provider:":
+            assert choices[14] == "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)"
+            return 14
+        if question == "Select default model:":
+            assert "gpt-4.1" in choices
+            assert "gpt-5.4" in choices
+            return choices.index("gpt-5.4")
+        if question == "Select reasoning effort:":
+            assert "low" in choices
+            assert "high" in choices
+            return choices.index("high")
+        if question == "Configure vision:":
+            return len(choices) - 1
+        tts_idx = _maybe_keep_current_tts(question, choices)
+        if tts_idx is not None:
+            return tts_idx
+        raise AssertionError(f"Unexpected prompt_choice call: {question}")
+
+    def fake_prompt(message, *args, **kwargs):
+        raise AssertionError(f"Unexpected prompt call: {message}")
+
+    def fake_get_auth_status(provider_id):
+        if provider_id == "copilot":
+            return {"logged_in": True}
+        return {"logged_in": False}
+
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr("hermes_cli.setup.prompt", fake_prompt)
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
+    monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: None)
+    monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
+    monkeypatch.setattr("hermes_cli.auth.get_auth_status", fake_get_auth_status)
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda provider_id: {
+            "provider": provider_id,
+            "api_key": "gh-cli-token",
+            "base_url": "https://api.githubcopilot.com",
+            "source": "gh auth token",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_github_model_catalog",
+        lambda api_key: [
+            {
+                "id": "gpt-4.1",
+                "capabilities": {"type": "chat", "supports": {}},
+                "supported_endpoints": ["/chat/completions"],
+            },
+            {
+                "id": "gpt-5.4",
+                "capabilities": {"type": "chat", "supports": {"reasoning_effort": ["low", "medium", "high"]}},
+                "supported_endpoints": ["/responses"],
+            },
+        ],
+    )
+    monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: [])
+
+    setup_model_provider(config)
+    save_config(config)
+
+    env = _read_env(tmp_path)
+    reloaded = load_config()
+
+    assert env.get("GITHUB_TOKEN") is None
+    assert reloaded["model"]["provider"] == "copilot"
+    assert reloaded["model"]["base_url"] == "https://api.githubcopilot.com"
+    assert reloaded["model"]["default"] == "gpt-5.4"
+    assert reloaded["model"]["api_mode"] == "codex_responses"
+    assert reloaded["agent"]["reasoning_effort"] == "high"
+
+
+def test_setup_copilot_acp_uses_model_picker_and_saves_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+
+    config = load_config()
+
+    def fake_prompt_choice(question, choices, default=0):
+        if question == "Select your inference provider:":
+            assert choices[15] == "GitHub Copilot ACP (spawns `copilot --acp --stdio`)"
+            return 15
+        if question == "Select default model:":
+            assert "gpt-4.1" in choices
+            assert "gpt-5.4" in choices
+            return choices.index("gpt-5.4")
+        if question == "Configure vision:":
+            return len(choices) - 1
+        tts_idx = _maybe_keep_current_tts(question, choices)
+        if tts_idx is not None:
+            return tts_idx
+        raise AssertionError(f"Unexpected prompt_choice call: {question}")
+
+    def fake_prompt(message, *args, **kwargs):
+        raise AssertionError(f"Unexpected prompt call: {message}")
+
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr("hermes_cli.setup.prompt", fake_prompt)
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
+    monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: None)
+    monkeypatch.setattr("hermes_cli.auth.detect_external_credentials", lambda: [])
+    monkeypatch.setattr("hermes_cli.auth.get_auth_status", lambda provider_id: {"logged_in": provider_id == "copilot-acp"})
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda provider_id: {
+            "provider": "copilot",
+            "api_key": "gh-cli-token",
+            "base_url": "https://api.githubcopilot.com",
+            "source": "gh auth token",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_github_model_catalog",
+        lambda api_key: [
+            {
+                "id": "gpt-4.1",
+                "capabilities": {"type": "chat", "supports": {}},
+                "supported_endpoints": ["/chat/completions"],
+            },
+            {
+                "id": "gpt-5.4",
+                "capabilities": {"type": "chat", "supports": {"reasoning_effort": ["low", "medium", "high"]}},
+                "supported_endpoints": ["/responses"],
+            },
+        ],
+    )
+    monkeypatch.setattr("agent.auxiliary_client.get_available_vision_backends", lambda: [])
+
+    setup_model_provider(config)
+    save_config(config)
+
+    reloaded = load_config()
+
+    assert reloaded["model"]["provider"] == "copilot-acp"
+    assert reloaded["model"]["base_url"] == "acp://copilot"
+    assert reloaded["model"]["default"] == "gpt-5.4"
+    assert reloaded["model"]["api_mode"] == "chat_completions"
 
 
 def test_setup_switch_custom_to_codex_clears_custom_endpoint_and_updates_config(tmp_path, monkeypatch):

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import shlex
 import stat
 import base64
 import hashlib
@@ -66,6 +67,8 @@ DEFAULT_AGENT_KEY_MIN_TTL_SECONDS = 30 * 60  # 30 minutes
 ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120       # refresh 2 min before expiry
 DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS = 1     # poll at most every 1s
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
+DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
@@ -108,6 +111,20 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="oauth_external",
         inference_base_url=DEFAULT_CODEX_BASE_URL,
     ),
+    "copilot": ProviderConfig(
+        id="copilot",
+        name="GitHub Copilot",
+        auth_type="api_key",
+        inference_base_url=DEFAULT_GITHUB_MODELS_BASE_URL,
+        api_key_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
+    ),
+    "copilot-acp": ProviderConfig(
+        id="copilot-acp",
+        name="GitHub Copilot ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
+        base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
     "zai": ProviderConfig(
         id="zai",
         name="Z.AI / GLM",
@@ -128,7 +145,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="minimax",
         name="MiniMax",
         auth_type="api_key",
-        inference_base_url="https://api.minimax.io/v1",
+        inference_base_url="https://api.minimax.io/anthropic",
         api_key_env_vars=("MINIMAX_API_KEY",),
         base_url_env_var="MINIMAX_BASE_URL",
     ),
@@ -151,7 +168,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="minimax-cn",
         name="MiniMax (China)",
         auth_type="api_key",
-        inference_base_url="https://api.minimaxi.com/v1",
+        inference_base_url="https://api.minimaxi.com/anthropic",
         api_key_env_vars=("MINIMAX_CN_API_KEY",),
         base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
@@ -182,9 +199,9 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     "opencode-go": ProviderConfig(
         id="opencode-go",
         name="OpenCode Go",
-        auth_type="***",
+        auth_type="api_key",
         inference_base_url="https://opencode.ai/zen/go/v1",
-        api_key_env_vars=("OPEN...",),
+        api_key_env_vars=("OPENCODE_GO_API_KEY",),
         base_url_env_var="OPENCODE_GO_BASE_URL",
     ),
     "kilocode": ProviderConfig(
@@ -220,6 +237,97 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
     if api_key.startswith("sk-kimi-"):
         return KIMI_CODE_BASE_URL
     return default_url
+
+
+def _gh_cli_candidates() -> list[str]:
+    """Return candidate ``gh`` binary paths, including common Homebrew installs."""
+    candidates: list[str] = []
+
+    resolved = shutil.which("gh")
+    if resolved:
+        candidates.append(resolved)
+
+    for candidate in (
+        "/opt/homebrew/bin/gh",
+        "/usr/local/bin/gh",
+        str(Path.home() / ".local" / "bin" / "gh"),
+    ):
+        if candidate in candidates:
+            continue
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            candidates.append(candidate)
+
+    return candidates
+
+
+def _try_gh_cli_token() -> Optional[str]:
+    """Return a token from ``gh auth token`` when the GitHub CLI is available."""
+    for gh_path in _gh_cli_candidates():
+        try:
+            result = subprocess.run(
+                [gh_path, "auth", "token"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.debug("gh CLI token lookup failed (%s): %s", gh_path, exc)
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
+
+
+_PLACEHOLDER_SECRET_VALUES = {
+    "*",
+    "**",
+    "***",
+    "changeme",
+    "your_api_key",
+    "your-api-key",
+    "placeholder",
+    "example",
+    "dummy",
+    "null",
+    "none",
+}
+
+
+def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
+    """Return True when a configured secret looks usable, not empty/placeholder."""
+    if not isinstance(value, str):
+        return False
+    cleaned = value.strip()
+    if len(cleaned) < min_length:
+        return False
+    if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
+        return False
+    return True
+
+
+def _resolve_api_key_provider_secret(
+    provider_id: str, pconfig: ProviderConfig
+) -> tuple[str, str]:
+    """Resolve an API-key provider's token and indicate where it came from."""
+    if provider_id == "copilot":
+        # Use the dedicated copilot auth module for proper token validation
+        try:
+            from hermes_cli.copilot_auth import resolve_copilot_token
+            token, source = resolve_copilot_token()
+            if token:
+                return token, source
+        except ValueError as exc:
+            logger.warning("Copilot token validation failed: %s", exc)
+        except Exception:
+            pass
+        return "", ""
+
+    for env_var in pconfig.api_key_env_vars:
+        val = os.getenv(env_var, "").strip()
+        if has_usable_secret(val):
+            return val, env_var
+
+    return "", ""
 
 
 # =============================================================================
@@ -572,6 +680,9 @@ def resolve_provider(
         "kimi": "kimi-coding", "moonshot": "kimi-coding",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
         "claude": "anthropic", "claude-code": "anthropic",
+        "github": "copilot", "github-copilot": "copilot",
+        "github-models": "copilot", "github-model": "copilot",
+        "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
@@ -579,8 +690,10 @@ def resolve_provider(
     }
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
-    if normalized in {"openrouter", "custom"}:
+    if normalized == "openrouter":
         return "openrouter"
+    if normalized == "custom":
+        return "custom"
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -604,15 +717,20 @@ def resolve_provider(
     except Exception as e:
         logger.debug("Could not detect active auth provider: %s", e)
 
-    if os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
+    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
 
     # Auto-detect API-key providers by checking their env vars
     for pid, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
+        # GitHub tokens are commonly present for repo/tool access but should not
+        # hijack inference auto-selection unless the user explicitly chooses
+        # Copilot/GitHub Models as the provider.
+        if pid == "copilot":
+            continue
         for env_var in pconfig.api_key_env_vars:
-            if os.getenv(env_var, "").strip():
+            if has_usable_secret(os.getenv(env_var, "")):
                 return pid
 
     return "openrouter"
@@ -1479,12 +1597,7 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    for env_var in pconfig.api_key_env_vars:
-        val = os.getenv(env_var, "").strip()
-        if val:
-            api_key = val
-            key_source = env_var
-            break
+    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
     env_url = ""
     if pconfig.base_url_env_var:
@@ -1507,6 +1620,36 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
+    """Status snapshot for providers that run a local subprocess."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "external_process":
+        return {"configured": False}
+
+    command = (
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or "copilot"
+    )
+    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    if not base_url:
+        base_url = pconfig.inference_base_url
+
+    resolved_command = shutil.which(command) if command else None
+    return {
+        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "provider": provider_id,
+        "name": pconfig.name,
+        "command": command,
+        "args": args,
+        "resolved_command": resolved_command,
+        "base_url": base_url,
+        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+    }
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = provider_id or get_active_provider()
@@ -1514,6 +1657,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_nous_auth_status()
     if target == "openai-codex":
         return get_codex_auth_status()
+    if target == "copilot-acp":
+        return get_external_process_provider_status(target)
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
@@ -1536,12 +1681,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    for env_var in pconfig.api_key_env_vars:
-        val = os.getenv(env_var, "").strip()
-        if val:
-            api_key = val
-            key_source = env_var
-            break
+    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
 
     env_url = ""
     if pconfig.base_url_env_var:
@@ -1559,6 +1699,46 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
         "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "source": key_source or "default",
+    }
+
+
+def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
+    """Resolve runtime details for local subprocess-backed providers."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "external_process":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an external-process provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    if not base_url:
+        base_url = pconfig.inference_base_url
+
+    command = (
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or "copilot"
+    )
+    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    resolved_command = shutil.which(command) if command else None
+    if not resolved_command and not base_url.startswith("acp+tcp://"):
+        raise AuthError(
+            f"Could not find the Copilot CLI command '{command}'. "
+            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            provider=provider_id,
+            code="missing_copilot_cli",
+        )
+
+    return {
+        "provider": provider_id,
+        "api_key": "copilot-acp",
+        "base_url": base_url.rstrip("/"),
+        "command": resolved_command or command,
+        "args": args,
+        "source": "process",
     }
 
 

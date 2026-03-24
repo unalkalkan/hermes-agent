@@ -119,6 +119,10 @@ DEFAULT_CONFIG = {
         "backend": "local",
         "cwd": ".",  # Use current directory
         "timeout": 180,
+        # Environment variables to pass through to sandboxed execution
+        # (terminal and execute_code).  Skill-declared required_environment_variables
+        # are passed through automatically; this list is for non-skill use cases.
+        "env_passthrough": [],
         "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "docker_forward_env": [],
         "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
@@ -145,6 +149,7 @@ DEFAULT_CONFIG = {
     
     "browser": {
         "inactivity_timeout": 120,
+        "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
     },
 
@@ -159,7 +164,7 @@ DEFAULT_CONFIG = {
     "compression": {
         "enabled": True,
         "threshold": 0.50,
-        "summary_model": "google/gemini-3-flash-preview",
+        "summary_model": "",  # empty = use main configured model
         "summary_provider": "auto",
         "summary_base_url": None,
     },
@@ -182,6 +187,7 @@ DEFAULT_CONFIG = {
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
             "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
+            "timeout": 30,         # seconds — increase for slow local vision models
         },
         "web_extract": {
             "provider": "auto",
@@ -236,7 +242,6 @@ DEFAULT_CONFIG = {
         "streaming": False,
         "show_cost": False,       # Show $ cost in the status bar (off by default)
         "skin": "default",
-        "theme_mode": "auto",
     },
 
     # Privacy settings
@@ -333,6 +338,14 @@ DEFAULT_CONFIG = {
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
     },
 
+    # WhatsApp platform settings (gateway mode)
+    "whatsapp": {
+        # Reply prefix prepended to every outgoing WhatsApp message.
+        # Default (None) uses the built-in "⚕ *Hermes Agent*" header.
+        # Set to "" (empty string) to disable the header entirely.
+        # Supports \n for newlines, e.g. "🤖 *My Bot*\n──────\n"
+    },
+
     # Approval mode for dangerous commands:
     #   manual — always prompt the user (default)
     #   smart  — use auxiliary LLM to auto-approve low-risk commands, prompt for high-risk
@@ -365,7 +378,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 9,
+    "_config_version": 10,
 }
 
 # =============================================================================
@@ -663,6 +676,11 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "HONCHO_BASE_URL": {
+        "description": "Base URL for self-hosted Honcho instances (no API key needed)",
+        "prompt": "Honcho base URL (e.g. http://localhost:8000)",
+        "category": "tool",
+    },
 
     # ── Messaging platforms ──
     "TELEGRAM_BOT_TOKEN": {
@@ -767,6 +785,59 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "messaging",
         "advanced": True,
+    },
+    "API_SERVER_ENABLED": {
+        "description": "Enable the OpenAI-compatible API server (true/false). Allows frontends like Open WebUI, LobeChat, etc. to connect.",
+        "prompt": "Enable API server (true/false)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "API_SERVER_KEY": {
+        "description": "Bearer token for API server authentication. If empty, all requests are allowed (local use only).",
+        "prompt": "API server auth key (optional)",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "API_SERVER_PORT": {
+        "description": "Port for the API server (default: 8642).",
+        "prompt": "API server port",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "API_SERVER_HOST": {
+        "description": "Host/bind address for the API server (default: 127.0.0.1). Use 0.0.0.0 for network access — requires API_SERVER_KEY for security.",
+        "prompt": "API server host",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "WEBHOOK_ENABLED": {
+        "description": "Enable the webhook platform adapter for receiving events from GitHub, GitLab, etc.",
+        "prompt": "Enable webhooks (true/false)",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+    },
+    "WEBHOOK_PORT": {
+        "description": "Port for the webhook HTTP server (default: 8644).",
+        "prompt": "Webhook port",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+    },
+    "WEBHOOK_SECRET": {
+        "description": "Global HMAC secret for webhook signature validation (overridable per route in config.yaml).",
+        "prompt": "Webhook secret",
+        "url": None,
+        "password": True,
+        "category": "messaging",
     },
 
     # ── Agent settings ──
@@ -1106,6 +1177,26 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _expand_env_vars(obj):
+    """Recursively expand ``${VAR}`` references in config values.
+
+    Only string values are processed; dict keys, numbers, booleans, and
+    None are left untouched.  Unresolved references (variable not in
+    ``os.environ``) are kept verbatim so callers can detect them.
+    """
+    if isinstance(obj, str):
+        return re.sub(
+            r"\${([^}]+)}",
+            lambda m: os.environ.get(m.group(1), m.group(0)),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {k: _expand_env_vars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_vars(item) for item in obj]
+    return obj
+
+
 def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize legacy root-level max_turns into agent.max_turns."""
     config = dict(config)
@@ -1147,7 +1238,7 @@ def load_config() -> Dict[str, Any]:
         except Exception as e:
             print(f"Warning: Failed to load config: {e}")
     
-    return _normalize_max_turns_config(config)
+    return _expand_env_vars(_normalize_max_turns_config(config))
 
 
 _SECURITY_COMMENT = """
@@ -1542,7 +1633,6 @@ def show_config():
     print(color("◆ Model", Colors.CYAN, Colors.BOLD))
     print(f"  Model:        {config.get('model', 'not set')}")
     print(f"  Max turns:    {config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])}")
-    print(f"  Toolsets:     {', '.join(config.get('toolsets', ['all']))}")
     
     # Display
     print()
@@ -1561,11 +1651,11 @@ def show_config():
     print(f"  Timeout:      {terminal.get('timeout', 60)}s")
     
     if terminal.get('backend') == 'docker':
-        print(f"  Docker image: {terminal.get('docker_image', 'python:3.11-slim')}")
+        print(f"  Docker image: {terminal.get('docker_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
     elif terminal.get('backend') == 'singularity':
-        print(f"  Image:        {terminal.get('singularity_image', 'docker://python:3.11')}")
+        print(f"  Image:        {terminal.get('singularity_image', 'docker://nikolaik/python-nodejs:python3.11-nodejs20')}")
     elif terminal.get('backend') == 'modal':
-        print(f"  Modal image:  {terminal.get('modal_image', 'python:3.11')}")
+        print(f"  Modal image:  {terminal.get('modal_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
         modal_token = get_env_value('MODAL_TOKEN_ID')
         print(f"  Modal token:  {'configured' if modal_token else '(not set)'}")
     elif terminal.get('backend') == 'daytona':
@@ -1595,7 +1685,8 @@ def show_config():
     print(f"  Enabled:      {'yes' if enabled else 'no'}")
     if enabled:
         print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
-        print(f"  Model:        {compression.get('summary_model', 'google/gemini-3-flash-preview')}")
+        _sm = compression.get('summary_model', '') or '(main model)'
+        print(f"  Model:        {_sm}")
         comp_provider = compression.get('summary_provider', 'auto')
         if comp_provider != 'auto':
             print(f"  Provider:     {comp_provider}")

@@ -60,9 +60,6 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 load_hermes_dotenv(project_env=PROJECT_ROOT / '.env')
 
-# Point mini-swe-agent at ~/.hermes/ so it shares our config
-os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(get_hermes_home()))
-os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
 import logging
 import time as _time
@@ -124,6 +121,17 @@ def _has_any_provider_configured() -> bool:
                     return True
         except Exception:
             pass
+
+    # Check provider-specific auth fallbacks (for example, Copilot via gh auth).
+    try:
+        for provider_id, pconfig in PROVIDER_REGISTRY.items():
+            if pconfig.auth_type != "api_key":
+                continue
+            status = get_auth_status(provider_id)
+            if status.get("logged_in"):
+                return True
+    except Exception:
+        pass
 
     # Check for Nous Portal OAuth credentials
     auth_file = get_hermes_home() / "auth.json"
@@ -775,6 +783,8 @@ def cmd_model(args):
         "openrouter": "OpenRouter",
         "nous": "Nous Portal",
         "openai-codex": "OpenAI Codex",
+        "copilot-acp": "GitHub Copilot ACP",
+        "copilot": "GitHub Copilot",
         "anthropic": "Anthropic",
         "zai": "Z.AI / GLM",
         "kimi-coding": "Kimi / Moonshot",
@@ -799,6 +809,8 @@ def cmd_model(args):
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
         ("openai-codex", "OpenAI Codex"),
+        ("copilot-acp", "GitHub Copilot ACP (spawns `copilot --acp --stdio`)"),
+        ("copilot", "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)"),
         ("anthropic", "Anthropic (Claude models — API key or Claude Code)"),
         ("zai", "Z.AI / GLM (Zhipu AI direct API)"),
         ("kimi-coding", "Kimi / Moonshot (Moonshot AI direct API)"),
@@ -867,6 +879,10 @@ def cmd_model(args):
         _model_flow_nous(config, current_model)
     elif selected_provider == "openai-codex":
         _model_flow_openai_codex(config, current_model)
+    elif selected_provider == "copilot-acp":
+        _model_flow_copilot_acp(config, current_model)
+    elif selected_provider == "copilot":
+        _model_flow_copilot(config, current_model)
     elif selected_provider == "custom":
         _model_flow_custom(config)
     elif selected_provider.startswith("custom:") and selected_provider in _custom_provider_map:
@@ -1118,9 +1134,20 @@ def _model_flow_custom(config):
         base_url = input(f"API base URL [{current_url or 'e.g. https://api.example.com/v1'}]: ").strip()
         api_key = input(f"API key [{current_key[:8] + '...' if current_key else 'optional'}]: ").strip()
         model_name = input("Model name (e.g. gpt-4, llama-3-70b): ").strip()
+        context_length_str = input("Context length in tokens [leave blank for auto-detect]: ").strip()
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")
         return
+
+    context_length = None
+    if context_length_str:
+        try:
+            context_length = int(context_length_str.replace(",", "").replace("k", "000").replace("K", "000"))
+            if context_length <= 0:
+                context_length = None
+        except ValueError:
+            print(f"Invalid context length: {context_length_str} — will auto-detect.")
+            context_length = None
 
     if not base_url and not current_url:
         print("No URL provided. Cancelled.")
@@ -1184,14 +1211,14 @@ def _model_flow_custom(config):
         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
 
     # Auto-save to custom_providers so it appears in the menu next time
-    _save_custom_provider(effective_url, effective_key, model_name or "")
+    _save_custom_provider(effective_url, effective_key, model_name or "", context_length=context_length)
 
 
-def _save_custom_provider(base_url, api_key="", model=""):
+def _save_custom_provider(base_url, api_key="", model="", context_length=None):
     """Save a custom endpoint to custom_providers in config.yaml.
 
     Deduplicates by base_url — if the URL already exists, updates the
-    model name but doesn't add a duplicate entry.
+    model name and context_length but doesn't add a duplicate entry.
     Auto-generates a display name from the URL hostname.
     """
     from hermes_cli.config import load_config, save_config
@@ -1201,14 +1228,24 @@ def _save_custom_provider(base_url, api_key="", model=""):
     if not isinstance(providers, list):
         providers = []
 
-    # Check if this URL is already saved — update model if so
+    # Check if this URL is already saved — update model/context_length if so
     for entry in providers:
         if isinstance(entry, dict) and entry.get("base_url", "").rstrip("/") == base_url.rstrip("/"):
+            changed = False
             if model and entry.get("model") != model:
                 entry["model"] = model
+                changed = True
+            if model and context_length:
+                models_cfg = entry.get("models", {})
+                if not isinstance(models_cfg, dict):
+                    models_cfg = {}
+                models_cfg[model] = {"context_length": context_length}
+                entry["models"] = models_cfg
+                changed = True
+            if changed:
                 cfg["custom_providers"] = providers
                 save_config(cfg)
-            return  # already saved, updated model if needed
+            return  # already saved, updated if needed
 
     # Auto-generate a name from the URL
     import re
@@ -1230,6 +1267,8 @@ def _save_custom_provider(base_url, api_key="", model=""):
         entry["api_key"] = api_key
     if model:
         entry["model"] = model
+    if model and context_length:
+        entry["models"] = {model: {"context_length": context_length}}
 
     providers.append(entry)
     cfg["custom_providers"] = providers
@@ -1407,6 +1446,25 @@ def _model_flow_named_custom(config, provider_info):
 
 # Curated model lists for direct API-key providers
 _PROVIDER_MODELS = {
+    "copilot-acp": [
+        "copilot-acp",
+    ],
+    "copilot": [
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5-mini",
+        "gpt-5.3-codex",
+        "gpt-5.2-codex",
+        "gpt-4.1",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "claude-opus-4.6",
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.5",
+        "claude-haiku-4.5",
+        "gemini-2.5-pro",
+        "grok-code-fast-1",
+    ],
     "zai": [
         "glm-5",
         "glm-4.7",
@@ -1445,6 +1503,376 @@ _PROVIDER_MODELS = {
         "google/gemini-3-flash-preview",
     ],
 }
+
+
+def _current_reasoning_effort(config) -> str:
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict):
+        return str(agent_cfg.get("reasoning_effort") or "").strip().lower()
+    return ""
+
+
+def _set_reasoning_effort(config, effort: str) -> None:
+    agent_cfg = config.get("agent")
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+        config["agent"] = agent_cfg
+    agent_cfg["reasoning_effort"] = effort
+
+
+def _prompt_reasoning_effort_selection(efforts, current_effort=""):
+    """Prompt for a reasoning effort. Returns effort, 'none', or None to keep current."""
+    ordered = list(dict.fromkeys(str(effort).strip().lower() for effort in efforts if str(effort).strip()))
+    if not ordered:
+        return None
+
+    def _label(effort):
+        if effort == current_effort:
+            return f"{effort}  ← currently in use"
+        return effort
+
+    disable_label = "Disable reasoning"
+    skip_label = "Skip (keep current)"
+
+    if current_effort == "none":
+        default_idx = len(ordered)
+    elif current_effort in ordered:
+        default_idx = ordered.index(current_effort)
+    elif "medium" in ordered:
+        default_idx = ordered.index("medium")
+    else:
+        default_idx = 0
+
+    try:
+        from simple_term_menu import TerminalMenu
+
+        choices = [f"  {_label(effort)}" for effort in ordered]
+        choices.append(f"  {disable_label}")
+        choices.append(f"  {skip_label}")
+        menu = TerminalMenu(
+            choices,
+            cursor_index=default_idx,
+            menu_cursor="-> ",
+            menu_cursor_style=("fg_green", "bold"),
+            menu_highlight_style=("fg_green",),
+            cycle_cursor=True,
+            clear_screen=False,
+            title="Select reasoning effort:",
+        )
+        idx = menu.show()
+        if idx is None:
+            return None
+        print()
+        if idx < len(ordered):
+            return ordered[idx]
+        if idx == len(ordered):
+            return "none"
+        return None
+    except (ImportError, NotImplementedError):
+        pass
+
+    print("Select reasoning effort:")
+    for i, effort in enumerate(ordered, 1):
+        print(f"  {i}. {_label(effort)}")
+    n = len(ordered)
+    print(f"  {n + 1}. {disable_label}")
+    print(f"  {n + 2}. {skip_label}")
+    print()
+
+    while True:
+        try:
+            choice = input(f"Choice [1-{n + 2}] (default: keep current): ").strip()
+            if not choice:
+                return None
+            idx = int(choice)
+            if 1 <= idx <= n:
+                return ordered[idx - 1]
+            if idx == n + 1:
+                return "none"
+            if idx == n + 2:
+                return None
+            print(f"Please enter 1-{n + 2}")
+        except ValueError:
+            print("Please enter a number")
+        except (KeyboardInterrupt, EOFError):
+            return None
+
+
+def _model_flow_copilot(config, current_model=""):
+    """GitHub Copilot flow using env vars, gh CLI, or OAuth device code."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        resolve_api_key_provider_credentials,
+    )
+    from hermes_cli.config import get_env_value, save_env_value, load_config, save_config
+    from hermes_cli.models import (
+        fetch_api_models,
+        fetch_github_model_catalog,
+        github_model_reasoning_efforts,
+        copilot_model_api_mode,
+        normalize_copilot_model_id,
+    )
+
+    provider_id = "copilot"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    creds = resolve_api_key_provider_credentials(provider_id)
+    api_key = creds.get("api_key", "")
+    source = creds.get("source", "")
+
+    if not api_key:
+        print("No GitHub token configured for GitHub Copilot.")
+        print()
+        print("  Supported token types:")
+        print("    → OAuth token (gho_*)          via `copilot login` or device code flow")
+        print("    → Fine-grained PAT (github_pat_*)  with Copilot Requests permission")
+        print("    → GitHub App token (ghu_*)     via environment variable")
+        print("    ✗ Classic PAT (ghp_*)          NOT supported by Copilot API")
+        print()
+        print("  Options:")
+        print("    1. Login with GitHub (OAuth device code flow)")
+        print("    2. Enter a token manually")
+        print("    3. Cancel")
+        print()
+        try:
+            choice = input("  Choice [1-3]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+
+        if choice == "1":
+            try:
+                from hermes_cli.copilot_auth import copilot_device_code_login
+                token = copilot_device_code_login()
+                if token:
+                    save_env_value("COPILOT_GITHUB_TOKEN", token)
+                    print("  Copilot token saved.")
+                    print()
+                else:
+                    print("  Login cancelled or failed.")
+                    return
+            except Exception as exc:
+                print(f"  Login failed: {exc}")
+                return
+        elif choice == "2":
+            try:
+                new_key = input("  Token (COPILOT_GITHUB_TOKEN): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return
+            if not new_key:
+                print("  Cancelled.")
+                return
+            # Validate token type
+            try:
+                from hermes_cli.copilot_auth import validate_copilot_token
+                valid, msg = validate_copilot_token(new_key)
+                if not valid:
+                    print(f"  ✗ {msg}")
+                    return
+            except ImportError:
+                pass
+            save_env_value("COPILOT_GITHUB_TOKEN", new_key)
+            print("  Token saved.")
+            print()
+        else:
+            print("  Cancelled.")
+            return
+
+        creds = resolve_api_key_provider_credentials(provider_id)
+        api_key = creds.get("api_key", "")
+        source = creds.get("source", "")
+    else:
+        if source in ("GITHUB_TOKEN", "GH_TOKEN"):
+            print(f"  GitHub token: {api_key[:8]}... ✓ ({source})")
+        elif source == "gh auth token":
+            print("  GitHub token: ✓ (from `gh auth token`)")
+        else:
+            print("  GitHub token: ✓")
+        print()
+
+    effective_base = pconfig.inference_base_url
+
+    catalog = fetch_github_model_catalog(api_key)
+    live_models = [item.get("id", "") for item in catalog if item.get("id")] if catalog else fetch_api_models(api_key, effective_base)
+    normalized_current_model = normalize_copilot_model_id(
+        current_model,
+        catalog=catalog,
+        api_key=api_key,
+    ) or current_model
+    if live_models:
+        model_list = [model_id for model_id in live_models if model_id]
+        print(f"  Found {len(model_list)} model(s) from GitHub Copilot")
+    else:
+        model_list = _PROVIDER_MODELS.get(provider_id, [])
+        if model_list:
+            print("  ⚠ Could not auto-detect models from GitHub Copilot — showing defaults.")
+            print('    Use "Enter custom model name" if you do not see your model.')
+
+    if model_list:
+        selected = _prompt_model_selection(model_list, current_model=normalized_current_model)
+    else:
+        try:
+            selected = input("Model name: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if selected:
+        selected = normalize_copilot_model_id(
+            selected,
+            catalog=catalog,
+            api_key=api_key,
+        ) or selected
+        # Clear stale custom-endpoint overrides so the Copilot provider wins cleanly.
+        if get_env_value("OPENAI_BASE_URL"):
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+
+        initial_cfg = load_config()
+        current_effort = _current_reasoning_effort(initial_cfg)
+        reasoning_efforts = github_model_reasoning_efforts(
+            selected,
+            catalog=catalog,
+            api_key=api_key,
+        )
+        selected_effort = None
+        if reasoning_efforts:
+            print(f"  {selected} supports reasoning controls.")
+            selected_effort = _prompt_reasoning_effort_selection(
+                reasoning_efforts, current_effort=current_effort
+            )
+
+        _save_model_choice(selected)
+
+        cfg = load_config()
+        model = cfg.get("model")
+        if not isinstance(model, dict):
+            model = {"default": model} if model else {}
+            cfg["model"] = model
+        model["provider"] = provider_id
+        model["base_url"] = effective_base
+        model["api_mode"] = copilot_model_api_mode(
+            selected,
+            catalog=catalog,
+            api_key=api_key,
+        )
+        if selected_effort is not None:
+            _set_reasoning_effort(cfg, selected_effort)
+        save_config(cfg)
+        deactivate_provider()
+
+        print(f"Default model set to: {selected} (via {pconfig.name})")
+        if reasoning_efforts:
+            if selected_effort == "none":
+                print("Reasoning disabled for this model.")
+            elif selected_effort:
+                print(f"Reasoning effort set to: {selected_effort}")
+    else:
+        print("No change.")
+
+
+def _model_flow_copilot_acp(config, current_model=""):
+    """GitHub Copilot ACP flow using the local Copilot CLI."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_api_key_provider_credentials,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.models import (
+        fetch_github_model_catalog,
+        normalize_copilot_model_id,
+    )
+    from hermes_cli.config import load_config, save_config
+
+    del config
+
+    provider_id = "copilot-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = status.get("resolved_command") or status.get("command") or "copilot"
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  GitHub Copilot ACP delegates Hermes turns to `copilot --acp`.")
+    print("  Hermes currently starts its own ACP subprocess for each request.")
+    print("  Hermes uses your selected model as a hint for the Copilot ACP session.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print("  Set HERMES_COPILOT_ACP_COMMAND or COPILOT_CLI_PATH if Copilot CLI is installed elsewhere.")
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+
+    catalog_api_key = ""
+    try:
+        catalog_creds = resolve_api_key_provider_credentials("copilot")
+        catalog_api_key = catalog_creds.get("api_key", "")
+    except Exception:
+        pass
+
+    catalog = fetch_github_model_catalog(catalog_api_key)
+    normalized_current_model = normalize_copilot_model_id(
+        current_model,
+        catalog=catalog,
+        api_key=catalog_api_key,
+    ) or current_model
+
+    if catalog:
+        model_list = [item.get("id", "") for item in catalog if item.get("id")]
+        print(f"  Found {len(model_list)} model(s) from GitHub Copilot")
+    else:
+        model_list = _PROVIDER_MODELS.get("copilot", [])
+        if model_list:
+            print("  ⚠ Could not auto-detect models from GitHub Copilot — showing defaults.")
+            print('    Use "Enter custom model name" if you do not see your model.')
+
+    if model_list:
+        selected = _prompt_model_selection(
+            model_list,
+            current_model=normalized_current_model,
+        )
+    else:
+        try:
+            selected = input("Model name: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if not selected:
+        print("No change.")
+        return
+
+    selected = normalize_copilot_model_id(
+        selected,
+        catalog=catalog,
+        api_key=catalog_api_key,
+    ) or selected
+    _save_model_choice(selected)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
 
 
 def _model_flow_kimi(config, current_model=""):
@@ -2128,14 +2556,55 @@ def _restore_stashed_changes(
         capture_output=True,
         text=True,
     )
-    if restore.returncode != 0:
-        print("✗ Update pulled new code, but restoring local changes failed.")
+
+    # Check for unmerged (conflicted) files — can happen even when returncode is 0
+    unmerged = subprocess.run(
+        git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    has_conflicts = bool(unmerged.stdout.strip())
+
+    if restore.returncode != 0 or has_conflicts:
+        print("✗ Update pulled new code, but restoring local changes hit conflicts.")
         if restore.stdout.strip():
             print(restore.stdout.strip())
         if restore.stderr.strip():
             print(restore.stderr.strip())
-        print("Your changes are still preserved in git stash.")
-        print(f"Resolve manually with: git stash apply {stash_ref}")
+
+        # Show which files conflicted
+        conflicted_files = unmerged.stdout.strip()
+        if conflicted_files:
+            print("\nConflicted files:")
+            for f in conflicted_files.splitlines():
+                print(f"  • {f}")
+
+        print("\nYour stashed changes are preserved — nothing is lost.")
+        print(f"  Stash ref: {stash_ref}")
+
+        # Ask before resetting (if interactive)
+        do_reset = True
+        if prompt_user:
+            print("\nReset working tree to clean state so Hermes can run?")
+            print("  (You can re-apply your changes later with: git stash apply)")
+            print("[Y/n] ", end="", flush=True)
+            response = input().strip().lower()
+            if response not in ("", "y", "yes"):
+                do_reset = False
+
+        if do_reset:
+            subprocess.run(
+                git_cmd + ["reset", "--hard", "HEAD"],
+                cwd=cwd,
+                capture_output=True,
+            )
+            print("Working tree reset to clean state.")
+        else:
+            print("Working tree left as-is (may have conflict markers).")
+            print("Resolve conflicts manually, then run: git stash drop")
+
+        print(f"Restore your changes with: git stash apply {stash_ref}")
         sys.exit(1)
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
@@ -2257,7 +2726,7 @@ def cmd_update(args):
 
         print("→ Pulling updates...")
         try:
-            subprocess.run(git_cmd + ["pull", "origin", branch], cwd=PROJECT_ROOT, check=True)
+            subprocess.run(git_cmd + ["pull", "--ff-only", "origin", branch], cwd=PROJECT_ROOT, check=True)
         finally:
             if auto_stash_ref is not None:
                 _restore_stashed_changes(
@@ -2510,7 +2979,7 @@ def _coalesce_session_name_args(argv: list) -> list:
     _SUBCOMMANDS = {
         "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
         "status", "cron", "doctor", "config", "pairing", "skills", "tools",
-        "sessions", "insights", "version", "update", "uninstall",
+        "mcp", "sessions", "insights", "version", "update", "uninstall",
     }
     _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
 
@@ -2642,7 +3111,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "anthropic", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -3099,6 +3568,46 @@ For more help on a command:
     skills_parser.set_defaults(func=cmd_skills)
 
     # =========================================================================
+    # plugins command
+    # =========================================================================
+    plugins_parser = subparsers.add_parser(
+        "plugins",
+        help="Manage plugins — install, update, remove, list",
+        description="Install plugins from Git repositories, update, remove, or list them.",
+    )
+    plugins_subparsers = plugins_parser.add_subparsers(dest="plugins_action")
+
+    plugins_install = plugins_subparsers.add_parser(
+        "install", help="Install a plugin from a Git URL or owner/repo"
+    )
+    plugins_install.add_argument(
+        "identifier",
+        help="Git URL or owner/repo shorthand (e.g. anpicasso/hermes-plugin-chrome-profiles)",
+    )
+    plugins_install.add_argument(
+        "--force", "-f", action="store_true",
+        help="Remove existing plugin and reinstall",
+    )
+
+    plugins_update = plugins_subparsers.add_parser(
+        "update", help="Pull latest changes for an installed plugin"
+    )
+    plugins_update.add_argument("name", help="Plugin name to update")
+
+    plugins_remove = plugins_subparsers.add_parser(
+        "remove", aliases=["rm", "uninstall"], help="Remove an installed plugin"
+    )
+    plugins_remove.add_argument("name", help="Plugin directory name to remove")
+
+    plugins_subparsers.add_parser("list", aliases=["ls"], help="List installed plugins")
+
+    def cmd_plugins(args):
+        from hermes_cli.plugins_cmd import plugins_command
+        plugins_command(args)
+
+    plugins_parser.set_defaults(func=cmd_plugins)
+
+    # =========================================================================
     # honcho command
     # =========================================================================
     honcho_parser = subparsers.add_parser(
@@ -3255,6 +3764,45 @@ For more help on a command:
 
     tools_parser.set_defaults(func=cmd_tools)
     # =========================================================================
+    # mcp command — manage MCP server connections
+    # =========================================================================
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="Manage MCP server connections",
+        description=(
+            "Add, remove, list, test, and configure MCP server connections.\n\n"
+            "MCP servers provide additional tools via the Model Context Protocol.\n"
+            "Use 'hermes mcp add' to connect to a new server with interactive\n"
+            "tool discovery. Run 'hermes mcp' with no subcommand to list servers."
+        ),
+    )
+    mcp_sub = mcp_parser.add_subparsers(dest="mcp_action")
+
+    mcp_add_p = mcp_sub.add_parser("add", help="Add an MCP server (discovery-first install)")
+    mcp_add_p.add_argument("name", help="Server name (used as config key)")
+    mcp_add_p.add_argument("--url", help="HTTP/SSE endpoint URL")
+    mcp_add_p.add_argument("--command", help="Stdio command (e.g. npx)")
+    mcp_add_p.add_argument("--args", nargs="*", default=[], help="Arguments for stdio command")
+    mcp_add_p.add_argument("--auth", choices=["oauth", "header"], help="Auth method")
+
+    mcp_rm_p = mcp_sub.add_parser("remove", aliases=["rm"], help="Remove an MCP server")
+    mcp_rm_p.add_argument("name", help="Server name to remove")
+
+    mcp_sub.add_parser("list", aliases=["ls"], help="List configured MCP servers")
+
+    mcp_test_p = mcp_sub.add_parser("test", help="Test MCP server connection")
+    mcp_test_p.add_argument("name", help="Server name to test")
+
+    mcp_cfg_p = mcp_sub.add_parser("configure", aliases=["config"], help="Toggle tool selection")
+    mcp_cfg_p.add_argument("name", help="Server name to configure")
+
+    def cmd_mcp(args):
+        from hermes_cli.mcp_config import mcp_command
+        mcp_command(args)
+
+    mcp_parser.set_defaults(func=cmd_mcp)
+
+    # =========================================================================
     # sessions command
     # =========================================================================
     sessions_parser = subparsers.add_parser(
@@ -3313,20 +3861,20 @@ For more help on a command:
                 return
             has_titles = any(s.get("title") for s in sessions)
             if has_titles:
-                print(f"{'Title':<22} {'Preview':<40} {'Last Active':<13} {'ID'}")
-                print("─" * 100)
+                print(f"{'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
+                print("─" * 110)
             else:
                 print(f"{'Preview':<50} {'Last Active':<13} {'Src':<6} {'ID'}")
-                print("─" * 90)
+                print("─" * 95)
             for s in sessions:
                 last_active = _relative_time(s.get("last_active"))
                 preview = s.get("preview", "")[:38] if has_titles else s.get("preview", "")[:48]
                 if has_titles:
-                    title = (s.get("title") or "—")[:20]
-                    sid = s["id"][:20]
-                    print(f"{title:<22} {preview:<40} {last_active:<13} {sid}")
+                    title = (s.get("title") or "—")[:30]
+                    sid = s["id"]
+                    print(f"{title:<32} {preview:<40} {last_active:<13} {sid}")
                 else:
-                    sid = s["id"][:20]
+                    sid = s["id"]
                     print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
 
         elif action == "export":

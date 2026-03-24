@@ -147,7 +147,7 @@ Default configuration:
 - Tests 3 models at different scales for robustness:
   - `qwen/qwen3-8b` (small)
   - `z-ai/glm-4.7-flash` (medium)
-  - `minimax/minimax-m2.5` (large)
+  - `minimax/minimax-m2.7` (large)
 - Total: ~144 rollouts
 
 This validates:
@@ -219,7 +219,7 @@ Training runs log to Weights & Biases with these key metrics:
 
 ## Log Files
 
-Each training run generates log files in `tinker-atropos/logs/`:
+Each training run generates log files in `~/.hermes/logs/rl_training/`:
 
 ```
 logs/

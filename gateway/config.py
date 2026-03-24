@@ -32,6 +32,15 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return bool(value)
 
 
+def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
+    """Normalize unauthorized DM behavior to a supported value."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"pair", "ignore"}:
+            return normalized
+    return default
+
+
 class Platform(Enum):
     """Supported messaging platforms."""
     LOCAL = "local"
@@ -46,6 +55,8 @@ class Platform(Enum):
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"
+    API_SERVER = "api_server"
+    WEBHOOK = "webhook"
 
 
 @dataclass
@@ -90,12 +101,16 @@ class SessionResetPolicy:
     mode: str = "both"  # "daily", "idle", "both", or "none"
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
+    notify: bool = True  # Send a notification to the user when auto-reset occurs
+    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
             "at_hour": self.at_hour,
             "idle_minutes": self.idle_minutes,
+            "notify": self.notify,
+            "notify_exclude_platforms": list(self.notify_exclude_platforms),
         }
     
     @classmethod
@@ -104,10 +119,14 @@ class SessionResetPolicy:
         mode = data.get("mode")
         at_hour = data.get("at_hour")
         idle_minutes = data.get("idle_minutes")
+        notify = data.get("notify")
+        exclude = data.get("notify_exclude_platforms")
         return cls(
             mode=mode if mode is not None else "both",
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
+            notify=notify if notify is not None else True,
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
         )
 
 
@@ -214,6 +233,9 @@ class GatewayConfig:
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
 
+    # Unauthorized DM policy
+    unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
 
@@ -237,6 +259,12 @@ class GatewayConfig:
                 connected.append(platform)
             # SMS uses api_key (Twilio auth token) — SID checked via env
             elif platform == Platform.SMS and os.getenv("TWILIO_ACCOUNT_SID"):
+                connected.append(platform)
+            # API Server uses enabled flag only (no token needed)
+            elif platform == Platform.API_SERVER:
+                connected.append(platform)
+            # Webhook uses enabled flag only (secrets are per-route)
+            elif platform == Platform.WEBHOOK:
                 connected.append(platform)
         return connected
     
@@ -285,6 +313,7 @@ class GatewayConfig:
             "always_log_local": self.always_log_local,
             "stt_enabled": self.stt_enabled,
             "group_sessions_per_user": self.group_sessions_per_user,
+            "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
         }
     
@@ -327,6 +356,10 @@ class GatewayConfig:
             stt_enabled = data.get("stt", {}).get("enabled") if isinstance(data.get("stt"), dict) else None
 
         group_sessions_per_user = data.get("group_sessions_per_user")
+        unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
+            data.get("unauthorized_dm_behavior"),
+            "pair",
+        )
 
         return cls(
             platforms=platforms,
@@ -339,72 +372,146 @@ class GatewayConfig:
             always_log_local=data.get("always_log_local", True),
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
+            unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
         )
+
+    def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
+        """Return the effective unauthorized-DM behavior for a platform."""
+        if platform:
+            platform_cfg = self.platforms.get(platform)
+            if platform_cfg and "unauthorized_dm_behavior" in platform_cfg.extra:
+                return _normalize_unauthorized_dm_behavior(
+                    platform_cfg.extra.get("unauthorized_dm_behavior"),
+                    self.unauthorized_dm_behavior,
+                )
+        return self.unauthorized_dm_behavior
 
 
 def load_gateway_config() -> GatewayConfig:
     """
     Load gateway configuration from multiple sources.
-    
+
     Priority (highest to lowest):
     1. Environment variables
-    2. ~/.hermes/gateway.json
-    3. cli-config.yaml gateway section
-    4. Defaults
+    2. ~/.hermes/config.yaml (primary user-facing config)
+    3. ~/.hermes/gateway.json (legacy — provides defaults under config.yaml)
+    4. Built-in defaults
     """
-    config = GatewayConfig()
-    
-    # Try loading from ~/.hermes/gateway.json
     _home = get_hermes_home()
-    gateway_config_path = _home / "gateway.json"
-    if gateway_config_path.exists():
-        try:
-            with open(gateway_config_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                config = GatewayConfig.from_dict(data)
-        except Exception as e:
-            print(f"[gateway] Warning: Failed to load {gateway_config_path}: {e}")
+    gw_data: dict = {}
 
-    # Bridge session_reset from config.yaml (the user-facing config file)
-    # into the gateway config. config.yaml takes precedence over gateway.json
-    # for session reset policy since that's where hermes setup writes it.
+    # Legacy fallback: gateway.json provides the base layer.
+    # config.yaml keys always win when both specify the same setting.
+    gateway_json_path = _home / "gateway.json"
+    if gateway_json_path.exists():
+        try:
+            with open(gateway_json_path, "r", encoding="utf-8") as f:
+                gw_data = json.load(f) or {}
+            logger.info(
+                "Loaded legacy %s — consider moving settings to config.yaml",
+                gateway_json_path,
+            )
+        except Exception as e:
+            logger.warning("Failed to load %s: %s", gateway_json_path, e)
+
+    # Primary source: config.yaml
     try:
         import yaml
         config_yaml_path = _home / "config.yaml"
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
+
+            # Map config.yaml keys → GatewayConfig.from_dict() schema.
+            # Each key overwrites whatever gateway.json may have set.
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):
-                config.default_reset_policy = SessionResetPolicy.from_dict(sr)
+                gw_data["default_reset_policy"] = sr
 
-            # Bridge quick commands from config.yaml into gateway runtime config.
-            # config.yaml is the user-facing config source, so when present it
-            # should override gateway.json for this setting.
             qc = yaml_cfg.get("quick_commands")
             if qc is not None:
                 if isinstance(qc, dict):
-                    config.quick_commands = qc
+                    gw_data["quick_commands"] = qc
                 else:
-                    logger.warning("Ignoring invalid quick_commands in config.yaml (expected mapping, got %s)", type(qc).__name__)
+                    logger.warning(
+                        "Ignoring invalid quick_commands in config.yaml "
+                        "(expected mapping, got %s)",
+                        type(qc).__name__,
+                    )
 
-            # Bridge STT enable/disable from config.yaml into gateway runtime.
-            # This keeps the gateway aligned with the user-facing config source.
             stt_cfg = yaml_cfg.get("stt")
-            if isinstance(stt_cfg, dict) and "enabled" in stt_cfg:
-                config.stt_enabled = _coerce_bool(stt_cfg.get("enabled"), True)
+            if isinstance(stt_cfg, dict):
+                gw_data["stt"] = stt_cfg
 
-            # Bridge group session isolation from config.yaml into gateway runtime.
-            # Secure default is per-user isolation in shared chats.
             if "group_sessions_per_user" in yaml_cfg:
-                config.group_sessions_per_user = _coerce_bool(
-                    yaml_cfg.get("group_sessions_per_user"),
-                    True,
+                gw_data["group_sessions_per_user"] = yaml_cfg["group_sessions_per_user"]
+
+            streaming_cfg = yaml_cfg.get("streaming")
+            if isinstance(streaming_cfg, dict):
+                gw_data["streaming"] = streaming_cfg
+
+            if "reset_triggers" in yaml_cfg:
+                gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
+
+            if "always_log_local" in yaml_cfg:
+                gw_data["always_log_local"] = yaml_cfg["always_log_local"]
+
+            if "unauthorized_dm_behavior" in yaml_cfg:
+                gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
+                    yaml_cfg.get("unauthorized_dm_behavior"),
+                    "pair",
                 )
 
-            # Bridge discord settings from config.yaml to env vars
-            # (env vars take precedence — only set if not already defined)
+            # Merge platforms section from config.yaml into gw_data so that
+            # nested keys like platforms.webhook.extra.routes are loaded.
+            yaml_platforms = yaml_cfg.get("platforms")
+            platforms_data = gw_data.setdefault("platforms", {})
+            if not isinstance(platforms_data, dict):
+                platforms_data = {}
+                gw_data["platforms"] = platforms_data
+            if isinstance(yaml_platforms, dict):
+                for plat_name, plat_block in yaml_platforms.items():
+                    if not isinstance(plat_block, dict):
+                        continue
+                    existing = platforms_data.get(plat_name, {})
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    # Deep-merge extra dicts so gateway.json defaults survive
+                    merged_extra = {**existing.get("extra", {}), **plat_block.get("extra", {})}
+                    merged = {**existing, **plat_block}
+                    if merged_extra:
+                        merged["extra"] = merged_extra
+                    platforms_data[plat_name] = merged
+                gw_data["platforms"] = platforms_data
+            for plat in Platform:
+                if plat == Platform.LOCAL:
+                    continue
+                platform_cfg = yaml_cfg.get(plat.value)
+                if not isinstance(platform_cfg, dict):
+                    continue
+                # Collect bridgeable keys from this platform section
+                bridged = {}
+                if "unauthorized_dm_behavior" in platform_cfg:
+                    bridged["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
+                        platform_cfg.get("unauthorized_dm_behavior"),
+                        gw_data.get("unauthorized_dm_behavior", "pair"),
+                    )
+                if "reply_prefix" in platform_cfg:
+                    bridged["reply_prefix"] = platform_cfg["reply_prefix"]
+                if not bridged:
+                    continue
+                plat_data = platforms_data.setdefault(plat.value, {})
+                if not isinstance(plat_data, dict):
+                    plat_data = {}
+                    platforms_data[plat.value] = plat_data
+                extra = plat_data.setdefault("extra", {})
+                if not isinstance(extra, dict):
+                    extra = {}
+                    plat_data["extra"] = extra
+                extra.update(bridged)
+
+            # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
             if isinstance(discord_cfg, dict):
                 if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
@@ -416,8 +523,15 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            "Failed to process config.yaml — falling back to .env / gateway.json values. "
+            "Check %s for syntax errors. Error: %s",
+            _home / "config.yaml",
+            e,
+        )
+
+    config = GatewayConfig.from_dict(gw_data)
 
     # Override with environment variables
     _apply_env_overrides(config)
@@ -634,6 +748,46 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 name=os.getenv("SMS_HOME_CHANNEL_NAME", "Home"),
             )
 
+    # API Server
+    api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
+    api_server_key = os.getenv("API_SERVER_KEY", "")
+    api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
+    api_server_port = os.getenv("API_SERVER_PORT")
+    api_server_host = os.getenv("API_SERVER_HOST")
+    if api_server_enabled or api_server_key:
+        if Platform.API_SERVER not in config.platforms:
+            config.platforms[Platform.API_SERVER] = PlatformConfig()
+        config.platforms[Platform.API_SERVER].enabled = True
+        if api_server_key:
+            config.platforms[Platform.API_SERVER].extra["key"] = api_server_key
+        if api_server_cors_origins:
+            origins = [origin.strip() for origin in api_server_cors_origins.split(",") if origin.strip()]
+            if origins:
+                config.platforms[Platform.API_SERVER].extra["cors_origins"] = origins
+        if api_server_port:
+            try:
+                config.platforms[Platform.API_SERVER].extra["port"] = int(api_server_port)
+            except ValueError:
+                pass
+        if api_server_host:
+            config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
+
+    # Webhook platform
+    webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")
+    webhook_port = os.getenv("WEBHOOK_PORT")
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "")
+    if webhook_enabled:
+        if Platform.WEBHOOK not in config.platforms:
+            config.platforms[Platform.WEBHOOK] = PlatformConfig()
+        config.platforms[Platform.WEBHOOK].enabled = True
+        if webhook_port:
+            try:
+                config.platforms[Platform.WEBHOOK].extra["port"] = int(webhook_port)
+            except ValueError:
+                pass
+        if webhook_secret:
+            config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
     if idle_minutes:
@@ -650,10 +804,3 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             pass
 
 
-def save_gateway_config(config: GatewayConfig) -> None:
-    """Save gateway configuration to ~/.hermes/gateway.json."""
-    gateway_config_path = get_hermes_home() / "gateway.json"
-    gateway_config_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(gateway_config_path, "w", encoding="utf-8") as f:
-        json.dump(config.to_dict(), f, indent=2)

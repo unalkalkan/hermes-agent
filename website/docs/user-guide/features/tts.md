@@ -10,20 +10,21 @@ Hermes Agent supports both text-to-speech output and voice message transcription
 
 ## Text-to-Speech
 
-Convert text to speech with three providers:
+Convert text to speech with four providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
 | **Edge TTS** (default) | Good | Free | None needed |
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
+| **NeuTTS** | Good | Free | None needed |
 
 ### Platform Delivery
 
 | Platform | Delivery | Format |
 |----------|----------|--------|
 | Telegram | Voice bubble (plays inline) | Opus `.ogg` |
-| Discord | Audio file attachment | MP3 |
+| Discord | Voice bubble (Opus/OGG), falls back to file attachment | Opus/MP3 |
 | WhatsApp | Audio file attachment | MP3 |
 | CLI | Saved to `~/.hermes/audio_cache/` | MP3 |
 
@@ -32,7 +33,7 @@ Convert text to speech with three providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "neutts"
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
   elevenlabs:
@@ -41,6 +42,12 @@ tts:
   openai:
     model: "gpt-4o-mini-tts"
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
+    base_url: "https://api.openai.com/v1"  # Override for OpenAI-compatible TTS endpoints
+  neutts:
+    ref_audio: ''
+    ref_text: ''
+    model: neuphonic/neutts-air-q4-gguf
+    device: cpu
 ```
 
 ### Telegram Voice Bubbles & ffmpeg
@@ -49,6 +56,7 @@ Telegram voice bubbles require Opus/OGG audio format:
 
 - **OpenAI and ElevenLabs** produce Opus natively — no extra setup
 - **Edge TTS** (default) outputs MP3 and needs **ffmpeg** to convert:
+- **NeuTTS** outputs WAV and also needs **ffmpeg** to convert for Telegram voice bubbles
 
 ```bash
 # Ubuntu/Debian
@@ -61,7 +69,7 @@ brew install ffmpeg
 sudo dnf install ffmpeg
 ```
 
-Without ffmpeg, Edge TTS audio is sent as a regular audio file (playable, but shows as a rectangular player instead of a voice bubble).
+Without ffmpeg, Edge TTS and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
 
 :::tip
 If you want voice bubbles without installing ffmpeg, switch to the OpenAI or ElevenLabs provider.

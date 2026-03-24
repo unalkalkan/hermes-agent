@@ -34,6 +34,7 @@ HERMES_DIR = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
 OUTPUT_DIR = CRON_DIR / "output"
+ONESHOT_GRACE_SECONDS = 120
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -220,6 +221,65 @@ def _ensure_aware(dt: datetime) -> datetime:
     return dt.astimezone(target_tz)
 
 
+def _recoverable_oneshot_run_at(
+    schedule: Dict[str, Any],
+    now: datetime,
+    *,
+    last_run_at: Optional[str] = None,
+) -> Optional[str]:
+    """Return a one-shot run time if it is still eligible to fire.
+
+    One-shot jobs get a small grace window so jobs created a few seconds after
+    their requested minute still run on the next tick. Once a one-shot has
+    already run, it is never eligible again.
+    """
+    if schedule.get("kind") != "once":
+        return None
+    if last_run_at:
+        return None
+
+    run_at = schedule.get("run_at")
+    if not run_at:
+        return None
+
+    run_at_dt = _ensure_aware(datetime.fromisoformat(run_at))
+    if run_at_dt >= now - timedelta(seconds=ONESHOT_GRACE_SECONDS):
+        return run_at
+    return None
+
+
+def _compute_grace_seconds(schedule: dict) -> int:
+    """Compute how late a job can be and still catch up instead of fast-forwarding.
+
+    Uses half the schedule period, clamped between 120 seconds and 2 hours.
+    This ensures daily jobs can catch up if missed by up to 2 hours,
+    while frequent jobs (every 5-10 min) still fast-forward quickly.
+    """
+    MIN_GRACE = 120
+    MAX_GRACE = 7200  # 2 hours
+
+    kind = schedule.get("kind")
+
+    if kind == "interval":
+        period_seconds = schedule.get("minutes", 1) * 60
+        grace = period_seconds // 2
+        return max(MIN_GRACE, min(grace, MAX_GRACE))
+
+    if kind == "cron" and HAS_CRONITER:
+        try:
+            now = _hermes_now()
+            cron = croniter(schedule["expr"], now)
+            first = cron.get_next(datetime)
+            second = cron.get_next(datetime)
+            period_seconds = int((second - first).total_seconds())
+            grace = period_seconds // 2
+            return max(MIN_GRACE, min(grace, MAX_GRACE))
+        except Exception:
+            pass
+
+    return MIN_GRACE
+
+
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
     """
     Compute the next run time for a schedule.
@@ -229,9 +289,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     now = _hermes_now()
 
     if schedule["kind"] == "once":
-        run_at = _ensure_aware(datetime.fromisoformat(schedule["run_at"]))
-        # If in the future, return it; if in the past, no more runs
-        return schedule["run_at"] if run_at > now else None
+        return _recoverable_oneshot_run_at(schedule, now, last_run_at=last_run_at)
 
     elif schedule["kind"] == "interval":
         minutes = schedule["minutes"]
@@ -324,6 +382,10 @@ def create_job(
         The created job dict
     """
     parsed_schedule = parse_schedule(schedule)
+
+    # Normalize repeat: treat 0 or negative values as None (infinite)
+    if repeat is not None and repeat <= 0:
+        repeat = None
 
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:
@@ -513,7 +575,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
                 # Check if we've hit the repeat limit
                 times = job["repeat"].get("times")
                 completed = job["repeat"]["completed"]
-                if times is not None and completed >= times:
+                if times is not None and times > 0 and completed >= times:
                     # Remove the job (limit reached)
                     jobs.pop(i)
                     save_jobs(jobs)
@@ -555,7 +617,26 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
         next_run = job.get("next_run_at")
         if not next_run:
-            continue
+            recovered_next = _recoverable_oneshot_run_at(
+                job.get("schedule", {}),
+                now,
+                last_run_at=job.get("last_run_at"),
+            )
+            if not recovered_next:
+                continue
+
+            job["next_run_at"] = recovered_next
+            next_run = recovered_next
+            logger.info(
+                "Job '%s' had no next_run_at; recovering one-shot run at %s",
+                job.get("name", job["id"]),
+                recovered_next,
+            )
+            for rj in raw_jobs:
+                if rj["id"] == job["id"]:
+                    rj["next_run_at"] = recovered_next
+                    needs_save = True
+                    break
 
         next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
         if next_run_dt <= now:
@@ -565,16 +646,18 @@ def get_due_jobs() -> List[Dict[str, Any]]:
             # For recurring jobs, check if the scheduled time is stale
             # (gateway was down and missed the window). Fast-forward to
             # the next future occurrence instead of firing a stale run.
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > 120:
-                # More than 2 minutes late — this is a missed run, not a current one.
-                # Recompute next_run_at to the next future occurrence.
+            grace = _compute_grace_seconds(schedule)
+            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
+                # Job is past its catch-up grace window — this is a stale missed run.
+                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())
                 if new_next:
                     logger.info(
-                        "Job '%s' missed its scheduled time (%s). "
+                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
                         "Fast-forwarding to next run: %s",
                         job.get("name", job["id"]),
                         next_run,
+                        grace,
                         new_next,
                     )
                     # Update the job in storage

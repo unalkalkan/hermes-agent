@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,6 +31,7 @@ def find_gateway_pids() -> list:
     pids = []
     patterns = [
         "hermes_cli.main gateway",
+        "hermes_cli/main.py gateway",
         "hermes gateway",
         "gateway/run.py",
     ]
@@ -369,13 +371,37 @@ def print_systemd_linger_guidance() -> None:
 def get_launchd_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
 
+def _detect_venv_dir() -> Path | None:
+    """Detect the active virtualenv directory.
+
+    Checks ``sys.prefix`` first (works regardless of the directory name),
+    then falls back to probing common directory names under PROJECT_ROOT.
+    Returns ``None`` when no virtualenv can be found.
+    """
+    # If we're running inside a virtualenv, sys.prefix points to it.
+    if sys.prefix != sys.base_prefix:
+        venv = Path(sys.prefix)
+        if venv.is_dir():
+            return venv
+
+    # Fallback: check common virtualenv directory names under the project root.
+    for candidate in (".venv", "venv"):
+        venv = PROJECT_ROOT / candidate
+        if venv.is_dir():
+            return venv
+
+    return None
+
+
 def get_python_path() -> str:
-    if is_windows():
-        venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
-    else:
-        venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
-    if venv_python.exists():
-        return str(venv_python)
+    venv = _detect_venv_dir()
+    if venv is not None:
+        if is_windows():
+            venv_python = venv / "Scripts" / "python.exe"
+        else:
+            venv_python = venv / "bin" / "python"
+        if venv_python.exists():
+            return str(venv_python)
     return sys.executable
 
 def get_hermes_cli_path() -> str:
@@ -397,12 +423,19 @@ def get_hermes_cli_path() -> str:
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
-    venv_dir = str(PROJECT_ROOT / "venv")
-    venv_bin = str(PROJECT_ROOT / "venv" / "bin")
+    detected_venv = _detect_venv_dir()
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
     node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
 
-    # Build a PATH that includes the venv, node_modules, and standard system dirs
-    sane_path = f"{venv_bin}:{node_bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    path_entries = [venv_bin, node_bin]
+    resolved_node = shutil.which("node")
+    if resolved_node:
+        resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        if resolved_node_dir not in path_entries:
+            path_entries.append(resolved_node_dir)
+    path_entries.extend(["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
+    sane_path = ":".join(path_entries)
 
     hermes_home = str(Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")).resolve())
 
@@ -412,6 +445,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -426,7 +461,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -440,6 +475,8 @@ WantedBy=multi-user.target
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -449,7 +486,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -842,6 +879,46 @@ def launchd_stop():
     subprocess.run(["launchctl", "stop", "ai.hermes.gateway"], check=True)
     print("✓ Service stopped")
 
+def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float = 5.0):
+    """Wait for the gateway process (by saved PID) to exit.
+
+    Uses the PID from the gateway.pid file — not launchd labels — so this
+    works correctly when multiple gateway instances run under separate
+    HERMES_HOME directories.
+
+    Args:
+        timeout: Total seconds to wait before giving up.
+        force_after: Seconds of graceful waiting before sending SIGKILL.
+    """
+    import time
+    from gateway.status import get_running_pid
+
+    deadline = time.monotonic() + timeout
+    force_deadline = time.monotonic() + force_after
+    force_sent = False
+
+    while time.monotonic() < deadline:
+        pid = get_running_pid()
+        if pid is None:
+            return  # Process exited cleanly.
+
+        if not force_sent and time.monotonic() >= force_deadline:
+            # Grace period expired — force-kill the specific PID.
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print(f"⚠ Gateway PID {pid} did not exit gracefully; sent SIGKILL")
+            except (ProcessLookupError, PermissionError):
+                return  # Already gone or we can't touch it.
+            force_sent = True
+
+        time.sleep(0.3)
+
+    # Timed out even after SIGKILL.
+    remaining_pid = get_running_pid()
+    if remaining_pid is not None:
+        print(f"⚠ Gateway PID {remaining_pid} still running after {timeout}s — restart may fail")
+
+
 def launchd_restart():
     try:
         launchd_stop()
@@ -849,6 +926,7 @@ def launchd_restart():
         if e.returncode != 3:
             raise
         print("↻ launchd job was unloaded; skipping stop")
+    _wait_for_gateway_exit()
     launchd_start()
 
 def launchd_status(deep: bool = False):
@@ -1746,10 +1824,9 @@ def gateway_command(args):
             killed = kill_gateway_processes()
             if killed:
                 print(f"✓ Stopped {killed} gateway process(es)")
-            
-            import time
-            time.sleep(2)
-            
+
+            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+
             # Start fresh
             print("Starting gateway...")
             run_gateway(verbose=False)

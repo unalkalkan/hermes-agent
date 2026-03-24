@@ -12,6 +12,7 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 
@@ -337,7 +338,17 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         # Track searches to detect *consecutive* repeated search loops.
-        search_key = ("search", pattern, target, str(path), file_glob or "")
+        # Include pagination args so users can page through truncated
+        # results without tripping the repeated-search guard.
+        search_key = (
+            "search",
+            pattern,
+            target,
+            str(path),
+            file_glob or "",
+            limit,
+            offset,
+        )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0, "read_history": set(),

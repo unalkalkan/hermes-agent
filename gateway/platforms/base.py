@@ -504,6 +504,14 @@ class BasePlatformAdapter(ABC):
         metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
         """
         pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Stop a persistent typing indicator (if the platform uses one).
+
+        Override in subclasses that start background typing loops.
+        Default is a no-op for platforms with one-shot typing indicators.
+        """
+        pass
     
     async def send_image(
         self,
@@ -713,7 +721,7 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -1099,6 +1107,22 @@ class BasePlatformAdapter(ABC):
             print(f"[{self.name}] Error handling message: {e}")
             import traceback
             traceback.print_exc()
+            # Send the error to the user so they aren't left with radio silence
+            try:
+                error_type = type(e).__name__
+                error_detail = str(e)[:300] if str(e) else "no details available"
+                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await self.send(
+                    chat_id=event.source.chat_id,
+                    content=(
+                        f"Sorry, I encountered an error ({error_type}).\n"
+                        f"{error_detail}\n"
+                        "Try again or use /reset to start a fresh session."
+                    ),
+                    metadata=_thread_metadata,
+                )
+            except Exception:
+                pass  # Last resort — don't let error reporting crash the handler
         finally:
             # Stop typing indicator
             typing_task.cancel()
