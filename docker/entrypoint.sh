@@ -111,6 +111,17 @@ SOUL_EOF
         fi
     fi
 
+    # Install Brave Search skill (bx-search) from ClawHub on first run
+    # https://github.com/brave/brave-search-skills/tree/main/clawhub/bx-search
+    if [ ! -f "$hermes_home/skills/bx-search/SKILL.md" ]; then
+        log_info "Installing bx-search skill from ClawHub..."
+        if hermes skills install bx-search --yes >/dev/null 2>&1; then
+            log_success "bx-search skill installed"
+        else
+            log_warn "Failed to auto-install bx-search skill (you can install later with: hermes skills install bx-search --yes)"
+        fi
+    fi
+
     # Mark as initialized
     date -Iseconds > "$hermes_home/.initialized"
     log_success "Hermes Agent initialized — data stored in $hermes_home/"
