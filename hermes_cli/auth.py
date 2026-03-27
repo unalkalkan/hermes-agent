@@ -311,15 +311,17 @@ def _resolve_api_key_provider_secret(
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
         # Use the dedicated copilot auth module for proper token validation
+        # and exchange the GitHub token for a Copilot API token.
         try:
-            from hermes_cli.copilot_auth import resolve_copilot_token
-            token, source = resolve_copilot_token()
-            if token:
-                return token, source
+            from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_token
+            github_token, source = resolve_copilot_token()
+            if github_token:
+                copilot_token = get_copilot_token(github_token)
+                return copilot_token, source
         except ValueError as exc:
             logger.warning("Copilot token validation failed: %s", exc)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Copilot token exchange failed: %s", exc)
         return "", ""
 
     for env_var in pconfig.api_key_env_vars:

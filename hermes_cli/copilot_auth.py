@@ -23,20 +23,29 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# OAuth device code flow constants (same client ID as opencode/Copilot CLI)
-COPILOT_OAUTH_CLIENT_ID = "Ov23li8tweQw6odWQebz"
+# OAuth device code flow constants (same client ID as VS Code Copilot extension)
+COPILOT_OAUTH_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 COPILOT_DEVICE_CODE_URL = "https://github.com/login/device/code"
 COPILOT_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
 
 # Copilot API constants
 COPILOT_TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 COPILOT_API_BASE_URL = "https://api.githubcopilot.com"
+
+# Copilot API versioning / impersonation constants
+_COPILOT_CHAT_VERSION = "0.26.7"
+_EDITOR_PLUGIN_VERSION = f"copilot-chat/{_COPILOT_CHAT_VERSION}"
+_COPILOT_USER_AGENT = f"GitHubCopilotChat/{_COPILOT_CHAT_VERSION}"
+_COPILOT_EDITOR_VERSION = "vscode/1.104.3"
+_COPILOT_API_VERSION = "2025-04-01"
 
 # Token type prefixes
 _CLASSIC_PAT_PREFIX = "ghp_"
@@ -48,6 +57,18 @@ COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # Polling constants
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
+
+# ─── Copilot Token Exchange Cache ──────────────────────────────────────────
+# The Copilot API requires a short-lived Copilot token obtained by exchanging
+# the GitHub OAuth/PAT token via api.github.com/copilot_internal/v2/token.
+# We cache the Copilot token and refresh it before it expires.
+
+_copilot_token_lock = threading.Lock()
+_copilot_token_cache: dict[str, str | float] = {
+    "github_token": "",
+    "copilot_token": "",
+    "expires_at": 0.0,
+}
 
 
 def is_classic_pat(token: str) -> bool:
@@ -271,6 +292,82 @@ def copilot_device_code_login(
     return None
 
 
+# ─── Copilot Token Exchange ─────────────────────────────────────────────────
+
+
+def _github_api_headers(github_token: str) -> dict[str, str]:
+    """Headers for requests to api.github.com (token exchange, user info)."""
+    return {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Editor-Version": _COPILOT_EDITOR_VERSION,
+        "Editor-Plugin-Version": _EDITOR_PLUGIN_VERSION,
+        "User-Agent": _COPILOT_USER_AGENT,
+        "X-GitHub-Api-Version": _COPILOT_API_VERSION,
+    }
+
+
+def exchange_copilot_token(github_token: str, *, timeout: float = 10.0) -> dict:
+    """Exchange a GitHub token for a short-lived Copilot API token.
+
+    Calls ``api.github.com/copilot_internal/v2/token`` and returns a dict
+    with keys ``token``, ``expires_at``, and ``refresh_in``.
+
+    The returned token is used as the Bearer token for all Copilot API
+    requests (chat completions, models listing, etc.).
+    """
+    import urllib.request
+
+    headers = _github_api_headers(github_token)
+    req = urllib.request.Request(
+        COPILOT_TOKEN_EXCHANGE_URL,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as exc:
+        logger.error("Copilot token exchange failed: %s", exc)
+        raise
+
+
+def get_copilot_token(github_token: str) -> str:
+    """Return a valid Copilot API token, refreshing if needed.
+
+    Uses a module-level cache so that multiple call sites in the same
+    process share the same token and avoid redundant exchanges.
+    """
+    with _copilot_token_lock:
+        now = time.time()
+        cache_hit = (
+            _copilot_token_cache["github_token"] == github_token
+            and _copilot_token_cache["copilot_token"]
+            and now < (_copilot_token_cache["expires_at"] - 60)  # 60s safety margin
+        )
+        if cache_hit:
+            return str(_copilot_token_cache["copilot_token"])
+
+    # Exchange outside the lock (network I/O)
+    data = exchange_copilot_token(github_token)
+    token = data.get("token", "")
+    expires_at = data.get("expires_at", 0)
+
+    if not token:
+        raise RuntimeError(
+            "Copilot token exchange returned an empty token. "
+            "Your GitHub token may not have Copilot access."
+        )
+
+    with _copilot_token_lock:
+        _copilot_token_cache["github_token"] = github_token
+        _copilot_token_cache["copilot_token"] = token
+        _copilot_token_cache["expires_at"] = float(expires_at)
+
+    logger.debug("Copilot token exchanged, expires_at=%s", expires_at)
+    return token
+
+
 # ─── Copilot API Headers ───────────────────────────────────────────────────
 
 def copilot_request_headers(
@@ -280,12 +377,16 @@ def copilot_request_headers(
 ) -> dict[str, str]:
     """Build the standard headers for Copilot API requests.
 
-    Replicates the header set used by opencode and the Copilot CLI.
+    Replicates the header set used by the VS Code Copilot Chat extension.
     """
     headers: dict[str, str] = {
-        "Editor-Version": "vscode/1.104.1",
-        "User-Agent": "HermesAgent/1.0",
-        "Openai-Intent": "conversation-edits",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Version": _COPILOT_EDITOR_VERSION,
+        "Editor-Plugin-Version": _EDITOR_PLUGIN_VERSION,
+        "User-Agent": _COPILOT_USER_AGENT,
+        "Openai-Intent": "conversation-panel",
+        "X-GitHub-Api-Version": _COPILOT_API_VERSION,
+        "X-Request-Id": str(uuid.uuid4()),
         "x-initiator": "agent" if is_agent_turn else "user",
     }
     if is_vision:

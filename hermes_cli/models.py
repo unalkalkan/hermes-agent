@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
-COPILOT_EDITOR_VERSION = "vscode/1.104.1"
+COPILOT_EDITOR_VERSION = "vscode/1.104.3"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 
@@ -680,17 +680,19 @@ def _extract_model_ids(payload: Any) -> list[str]:
 def copilot_default_headers() -> dict[str, str]:
     """Standard headers for Copilot API requests.
 
-    Includes Openai-Intent and x-initiator headers that opencode and the
-    Copilot CLI send on every request.
+    Includes headers that the VS Code Copilot Chat extension sends on
+    every request.
     """
     try:
         from hermes_cli.copilot_auth import copilot_request_headers
         return copilot_request_headers(is_agent_turn=True)
     except ImportError:
         return {
+            "Copilot-Integration-Id": "vscode-chat",
             "Editor-Version": COPILOT_EDITOR_VERSION,
-            "User-Agent": "HermesAgent/1.0",
-            "Openai-Intent": "conversation-edits",
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Openai-Intent": "conversation-panel",
+            "X-GitHub-Api-Version": "2025-04-01",
             "x-initiator": "agent",
         }
 

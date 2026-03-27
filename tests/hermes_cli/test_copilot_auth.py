@@ -120,9 +120,12 @@ class TestRequestHeaders:
     def test_default_headers_include_openai_intent(self):
         from hermes_cli.copilot_auth import copilot_request_headers
         headers = copilot_request_headers()
-        assert headers["Openai-Intent"] == "conversation-edits"
-        assert headers["User-Agent"] == "HermesAgent/1.0"
+        assert headers["Openai-Intent"] == "conversation-panel"
+        assert headers["User-Agent"] == "GitHubCopilotChat/0.26.7"
         assert "Editor-Version" in headers
+        assert headers["Copilot-Integration-Id"] == "vscode-chat"
+        assert "X-GitHub-Api-Version" in headers
+        assert "X-Request-Id" in headers
 
     def test_agent_turn_sets_initiator(self):
         from hermes_cli.copilot_auth import copilot_request_headers
@@ -152,7 +155,7 @@ class TestCopilotDefaultHeaders:
         from hermes_cli.models import copilot_default_headers
         headers = copilot_default_headers()
         assert "Openai-Intent" in headers
-        assert headers["Openai-Intent"] == "conversation-edits"
+        assert headers["Openai-Intent"] == "conversation-panel"
 
     def test_includes_x_initiator(self):
         from hermes_cli.models import copilot_default_headers

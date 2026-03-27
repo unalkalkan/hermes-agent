@@ -280,6 +280,10 @@ class TestApiKeyProviderStatus:
 
     def test_copilot_status_uses_gh_cli_token(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_gh_cli_token")
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.get_copilot_token",
+            lambda t: "copilot-exchanged-token",
+        )
         status = get_api_key_provider_status("copilot")
         assert status["configured"] is True
         assert status["logged_in"] is True
@@ -333,18 +337,26 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["source"] == "GLM_API_KEY"
 
     def test_resolve_copilot_with_github_token(self, monkeypatch):
-        monkeypatch.setenv("GITHUB_TOKEN", "gh-env-secret")
+        monkeypatch.setenv("GITHUB_TOKEN", "gho_env_secret")
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.get_copilot_token",
+            lambda t: "copilot-exchanged-token",
+        )
         creds = resolve_api_key_provider_credentials("copilot")
         assert creds["provider"] == "copilot"
-        assert creds["api_key"] == "gh-env-secret"
+        assert creds["api_key"] == "copilot-exchanged-token"
         assert creds["base_url"] == "https://api.githubcopilot.com"
         assert creds["source"] == "GITHUB_TOKEN"
 
     def test_resolve_copilot_with_gh_cli_fallback(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.get_copilot_token",
+            lambda t: "copilot-exchanged-cli-token",
+        )
         creds = resolve_api_key_provider_credentials("copilot")
         assert creds["provider"] == "copilot"
-        assert creds["api_key"] == "gho_cli_secret"
+        assert creds["api_key"] == "copilot-exchanged-cli-token"
         assert creds["base_url"] == "https://api.githubcopilot.com"
         assert creds["source"] == "gh auth token"
 
@@ -516,15 +528,23 @@ class TestRuntimeProviderResolution:
 
     def test_runtime_copilot_uses_gh_cli_token(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.get_copilot_token",
+            lambda t: "copilot-exchanged-token",
+        )
         from hermes_cli.runtime_provider import resolve_runtime_provider
         result = resolve_runtime_provider(requested="copilot")
         assert result["provider"] == "copilot"
         assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "gho_cli_secret"
+        assert result["api_key"] == "copilot-exchanged-token"
         assert result["base_url"] == "https://api.githubcopilot.com"
 
     def test_runtime_copilot_uses_responses_for_gpt_5_4(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.copilot_auth._try_gh_cli_token", lambda: "gho_cli_secret")
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.get_copilot_token",
+            lambda t: "copilot-exchanged-token",
+        )
         monkeypatch.setattr(
             "hermes_cli.runtime_provider._get_model_config",
             lambda: {"provider": "copilot", "default": "gpt-5.4"},
