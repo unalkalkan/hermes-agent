@@ -9,6 +9,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'getting-started/quickstart',
         'getting-started/installation',
+        'getting-started/nix-setup',
         'getting-started/updating',
         'getting-started/learning-path',
       ],
@@ -106,6 +107,13 @@ const sidebars: SidebarsConfig = {
           items: [
             'user-guide/features/batch-processing',
             'user-guide/features/rl-training',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Skills',
+          items: [
+            'user-guide/skills/godmode',
           ],
         },
       ],

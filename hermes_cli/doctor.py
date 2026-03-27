@@ -8,7 +8,6 @@ import os
 import sys
 import subprocess
 import shutil
-from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 
@@ -448,7 +447,7 @@ def run_doctor(args):
             check_fail("DAYTONA_API_KEY not set", "(required for TERMINAL_ENV=daytona)")
             issues.append("Set DAYTONA_API_KEY environment variable")
         try:
-            from daytona import Daytona
+            from daytona import Daytona  # noqa: F401 — SDK presence check
             check_ok("daytona SDK", "(installed)")
         except ImportError:
             check_fail("daytona SDK not installed", "(pip install daytona)")
@@ -706,7 +705,7 @@ def run_doctor(args):
         _honcho_cfg_path = resolve_config_path()
 
         if not _honcho_cfg_path.exists():
-            check_warn("Honcho config not found", f"run: hermes honcho setup")
+            check_warn("Honcho config not found", "run: hermes honcho setup")
         elif not hcfg.enabled:
             check_info(f"Honcho disabled (set enabled: true in {_honcho_cfg_path} to activate)")
         elif not hcfg.api_key:

@@ -41,7 +41,7 @@ import logging
 import os
 import threading
 import time
-from pathlib import Path
+from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -82,7 +82,7 @@ auxiliary_is_nous: bool = False
 
 # Default auxiliary models per provider
 _OPENROUTER_MODEL = "google/gemini-3-flash-preview"
-_NOUS_MODEL = "gemini-3-flash"
+_NOUS_MODEL = "google/gemini-3-flash-preview"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
@@ -693,7 +693,13 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     is_oauth = _is_oauth_token(token)
     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
-    real_client = build_anthropic_client(token, base_url)
+    try:
+        real_client = build_anthropic_client(token, base_url)
+    except ImportError:
+        # The anthropic_adapter module imports fine but the SDK itself is
+        # missing — build_anthropic_client raises ImportError at call time
+        # when _anthropic_sdk is None.  Treat as unavailable.
+        return None, None
     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
 
 
@@ -1258,13 +1264,33 @@ def _get_cached_client(
     base_url: str = None,
     api_key: str = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
-    """Get or create a cached client for the given provider."""
-    cache_key = (provider, async_mode, base_url or "", api_key or "")
+    """Get or create a cached client for the given provider.
+
+    Async clients (AsyncOpenAI) use httpx.AsyncClient internally, which
+    binds to the event loop that was current when the client was created.
+    Using such a client on a *different* loop causes deadlocks or
+    RuntimeError.  To prevent cross-loop issues (especially in gateway
+    mode where _run_async() may spawn fresh loops in worker threads), the
+    cache key for async clients includes the current event loop's identity
+    so each loop gets its own client instance.
+    """
+    # Include loop identity for async clients to prevent cross-loop reuse.
+    # httpx.AsyncClient (inside AsyncOpenAI) is bound to the loop where it
+    # was created — reusing it on a different loop causes deadlocks (#2681).
+    loop_id = 0
+    current_loop = None
+    if async_mode:
+        try:
+            import asyncio as _aio
+            current_loop = _aio.get_event_loop()
+            loop_id = id(current_loop)
+        except RuntimeError:
+            pass
+    cache_key = (provider, async_mode, base_url or "", api_key or "", loop_id)
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
             if async_mode:
-                # Async clients are bound to the event loop that created them.
                 # A cached async client whose loop has been closed will raise
                 # "Event loop is closed" when httpx tries to clean up its
                 # transport.  Discard the stale client and create a fresh one.
@@ -1286,13 +1312,7 @@ def _get_cached_client(
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
-        bound_loop = None
-        if async_mode:
-            try:
-                import asyncio as _aio
-                bound_loop = _aio.get_event_loop()
-            except RuntimeError:
-                pass
+        bound_loop = current_loop
         with _client_cache_lock:
             if cache_key not in _client_cache:
                 _client_cache[cache_key] = (client, default_model, bound_loop)

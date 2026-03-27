@@ -46,14 +46,16 @@ Project-local plugins under `./.hermes/plugins/` are disabled by default. Enable
 
 ## Available hooks
 
+Plugins can register callbacks for these lifecycle events. See the **[Event Hooks page](/docs/user-guide/features/hooks#plugin-hooks)** for full details, callback signatures, and examples.
+
 | Hook | Fires when |
 |------|-----------|
 | `pre_tool_call` | Before any tool executes |
 | `post_tool_call` | After any tool returns |
-| `pre_llm_call` | Before LLM API request |
-| `post_llm_call` | After LLM API response |
-| `on_session_start` | Session begins |
-| `on_session_end` | Session ends |
+| `pre_llm_call` | Before LLM API request *(planned)* |
+| `post_llm_call` | After LLM API response *(planned)* |
+| `on_session_start` | Session begins *(planned)* |
+| `on_session_end` | Session ends *(planned)* |
 
 ## Slash commands
 
@@ -81,6 +83,7 @@ The handler receives the argument string (everything after `/greet`) and returns
 | `aliases` | Tuple of alternative names |
 | `cli_only` | Only available in CLI |
 | `gateway_only` | Only available in messaging platforms |
+| `gateway_config_gate` | Config dotpath (e.g. `"display.my_option"`). When set on a `cli_only` command, the command becomes available in the gateway if the config value is truthy. |
 
 ## Managing plugins
 

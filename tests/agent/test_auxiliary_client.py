@@ -307,9 +307,8 @@ class TestExpiredCodexFallback:
 
 
     def test_hermes_oauth_file_sets_oauth_flag(self, monkeypatch):
-        """Hermes OAuth credentials should get is_oauth=True (token is not sk-ant-api-*)."""
+        """OAuth-style tokens should get is_oauth=True (token is not sk-ant-api-*)."""
         # Mock resolve_anthropic_token to return an OAuth-style token
-        # (simulates what read_hermes_oauth_credentials would return)
         with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="hermes-oauth-jwt-token"), \
              patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
             mock_build.return_value = MagicMock()
@@ -462,7 +461,7 @@ class TestGetTextAuxiliaryClient:
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_nous.return_value = {"access_token": "nous-tok"}
             client, model = get_text_auxiliary_client()
-        assert model == "gemini-3-flash"
+        assert model == "google/gemini-3-flash-preview"
 
     def test_custom_endpoint_over_codex(self, monkeypatch, codex_auth_dir):
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:1234/v1")
@@ -694,7 +693,7 @@ class TestVisionClientFallback:
              patch("agent.auxiliary_client.OpenAI"):
             mock_nous.return_value = {"access_token": "nous-tok"}
             client, model = get_vision_auxiliary_client()
-        assert model == "gemini-3-flash"
+        assert model == "google/gemini-3-flash-preview"
         assert client is not None
 
     def test_vision_forced_main_uses_custom_endpoint(self, monkeypatch):
@@ -790,7 +789,7 @@ class TestResolveForcedProvider:
              patch("agent.auxiliary_client.OpenAI"):
             mock_nous.return_value = {"access_token": "nous-tok"}
             client, model = _resolve_forced_provider("nous")
-        assert model == "gemini-3-flash"
+        assert model == "google/gemini-3-flash-preview"
         assert client is not None
 
     def test_forced_nous_not_configured(self, monkeypatch):

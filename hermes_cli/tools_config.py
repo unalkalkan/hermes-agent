@@ -13,11 +13,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-import os
 
 from hermes_cli.config import (
     load_config, save_config, get_env_value, save_env_value,
-    get_hermes_home,
 )
 from hermes_cli.colors import Colors, color
 
@@ -133,8 +131,10 @@ PLATFORMS = {
     "slack":    {"label": "💼 Slack",      "default_toolset": "hermes-slack"},
     "whatsapp": {"label": "📱 WhatsApp",   "default_toolset": "hermes-whatsapp"},
     "signal":   {"label": "📡 Signal",     "default_toolset": "hermes-signal"},
+    "homeassistant": {"label": "🏠 Home Assistant", "default_toolset": "hermes-homeassistant"},
     "email":    {"label": "📧 Email",      "default_toolset": "hermes-email"},
     "dingtalk": {"label": "💬 DingTalk",   "default_toolset": "hermes-dingtalk"},
+    "api_server": {"label": "🌐 API Server", "default_toolset": "hermes-api-server"},
 }
 
 
@@ -380,9 +380,31 @@ def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = Non
     return summary
 
 
-def _get_platform_tools(config: dict, platform: str) -> Set[str]:
+def _parse_enabled_flag(value, default: bool = True) -> bool:
+    """Parse bool-like config values used by tool/platform settings."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return default
+
+
+def _get_platform_tools(
+    config: dict,
+    platform: str,
+    *,
+    include_default_mcp_servers: bool = True,
+) -> Set[str]:
     """Resolve which individual toolset names are enabled for a platform."""
-    from toolsets import resolve_toolset, TOOLSETS
+    from toolsets import resolve_toolset
 
     platform_toolsets = config.get("platform_toolsets", {})
     toolset_names = platform_toolsets.get(platform)
@@ -431,6 +453,37 @@ def _get_platform_tools(config: dict, platform: str) -> Set[str]:
                 # New plugin not yet seen by hermes tools — default enabled
                 enabled_toolsets.add(pts)
             # else: known but not in config = user disabled it
+
+    # Preserve any explicit non-configurable toolset entries (for example,
+    # custom toolsets or MCP server names saved in platform_toolsets).
+    platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    explicit_passthrough = {
+        ts
+        for ts in toolset_names
+        if ts not in configurable_keys
+        and ts not in plugin_ts_keys
+        and ts not in platform_default_keys
+    }
+
+    # MCP servers are expected to be available on all platforms by default.
+    # If the platform explicitly lists one or more MCP server names, treat that
+    # as an allowlist. Otherwise include every globally enabled MCP server.
+    mcp_servers = config.get("mcp_servers", {})
+    enabled_mcp_servers = {
+        name
+        for name, server_cfg in mcp_servers.items()
+        if isinstance(server_cfg, dict)
+        and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
+    }
+    explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
+    enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
+    if include_default_mcp_servers:
+        if explicit_mcp_servers:
+            enabled_toolsets.update(explicit_mcp_servers)
+        else:
+            enabled_toolsets.update(enabled_mcp_servers)
+    else:
+        enabled_toolsets.update(explicit_mcp_servers)
 
     return enabled_toolsets
 
@@ -661,7 +714,7 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
         # Multiple providers - let user choose
         print()
         # Use custom title if provided (e.g. "Select Search Provider")
-        title = cat.get("setup_title", f"Choose a provider")
+        title = cat.get("setup_title", "Choose a provider")
         print(color(f"  --- {icon} {name} - {title} ---", Colors.CYAN))
         if cat.get("setup_note"):
             _print_info(f"  {cat['setup_note']}")
@@ -770,9 +823,9 @@ def _configure_provider(provider: dict, config: dict):
 
             if value:
                 save_env_value(var["key"], value)
-                _print_success(f"    Saved")
+                _print_success("    Saved")
             else:
-                _print_warning(f"    Skipped")
+                _print_warning("    Skipped")
                 all_configured = False
 
     # Run post-setup hooks if needed
@@ -836,9 +889,9 @@ def _configure_simple_requirements(ts_key: str):
         value = _prompt(f"    {var}", password=True)
         if value and value.strip():
             save_env_value(var, value.strip())
-            _print_success(f"    Saved")
+            _print_success("    Saved")
         else:
-            _print_warning(f"    Skipped")
+            _print_warning("    Skipped")
 
 
 def _reconfigure_tool(config: dict):
@@ -926,7 +979,7 @@ def _reconfigure_provider(provider: dict, config: dict):
             _print_success(f"  Browser cloud provider set to: {bp}")
         else:
             config.get("browser", {}).pop("cloud_provider", None)
-            _print_success(f"  Browser set to local mode")
+            _print_success("  Browser set to local mode")
 
     # Set web search backend in config if applicable
     if provider.get("web_backend"):
@@ -948,9 +1001,9 @@ def _reconfigure_provider(provider: dict, config: dict):
         value = _prompt(f"    {var.get('prompt', var['key'])} (Enter to keep current)", password=not default_val)
         if value and value.strip():
             save_env_value(var["key"], value.strip())
-            _print_success(f"    Updated")
+            _print_success("    Updated")
         else:
-            _print_info(f"    Kept current")
+            _print_info("    Kept current")
 
 
 def _reconfigure_simple_requirements(ts_key: str):
@@ -972,9 +1025,9 @@ def _reconfigure_simple_requirements(ts_key: str):
         value = _prompt(f"    {var} (Enter to keep current)", password=True)
         if value and value.strip():
             save_env_value(var, value.strip())
-            _print_success(f"    Updated")
+            _print_success("    Updated")
         else:
-            _print_info(f"    Kept current")
+            _print_info("    Kept current")
 
 
 # ─── Main Entry Point ─────────────────────────────────────────────────────────
@@ -1024,7 +1077,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     if first_install:
         for pkey in enabled_platforms:
             pinfo = PLATFORMS[pkey]
-            current_enabled = _get_platform_tools(config, pkey)
+            current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
 
             # Uncheck toolsets that should be off by default
             checklist_preselected = current_enabled - _DEFAULT_OFF_TOOLSETS
@@ -1076,7 +1129,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     platform_keys = []
     for pkey in enabled_platforms:
         pinfo = PLATFORMS[pkey]
-        current = _get_platform_tools(config, pkey)
+        current = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
         count = len(current)
         total = len(_get_effective_configurable_toolsets())
         platform_choices.append(f"Configure {pinfo['label']}  ({count}/{total} enabled)")
@@ -1123,11 +1176,11 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             # Use the union of all platforms' current tools as the starting state
             all_current = set()
             for pk in platform_keys:
-                all_current |= _get_platform_tools(config, pk)
+                all_current |= _get_platform_tools(config, pk, include_default_mcp_servers=False)
             new_enabled = _prompt_toolset_checklist("All platforms", all_current)
             if new_enabled != all_current:
                 for pk in platform_keys:
-                    prev = _get_platform_tools(config, pk)
+                    prev = _get_platform_tools(config, pk, include_default_mcp_servers=False)
                     added = new_enabled - prev
                     removed = prev - new_enabled
                     pinfo_inner = PLATFORMS[pk]
@@ -1149,7 +1202,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                 print(color("  ✓ Saved configuration for all platforms", Colors.GREEN))
                 # Update choice labels
                 for ci, pk in enumerate(platform_keys):
-                    new_count = len(_get_platform_tools(config, pk))
+                    new_count = len(_get_platform_tools(config, pk, include_default_mcp_servers=False))
                     total = len(_get_effective_configurable_toolsets())
                     platform_choices[ci] = f"Configure {PLATFORMS[pk]['label']}  ({new_count}/{total} enabled)"
             else:
@@ -1161,7 +1214,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         pinfo = PLATFORMS[pkey]
 
         # Get current enabled toolsets for this platform
-        current_enabled = _get_platform_tools(config, pkey)
+        current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
 
         # Show checklist
         new_enabled = _prompt_toolset_checklist(pinfo["label"], current_enabled)
@@ -1194,7 +1247,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         print()
 
         # Update the choice label with new count
-        new_count = len(_get_platform_tools(config, pkey))
+        new_count = len(_get_platform_tools(config, pkey, include_default_mcp_servers=False))
         total = len(_get_effective_configurable_toolsets())
         platform_choices[idx] = f"Configure {pinfo['label']}  ({new_count}/{total} enabled)"
 
@@ -1340,7 +1393,7 @@ def _configure_mcp_tools_interactive(config: dict):
 
 def _apply_toolset_change(config: dict, platform: str, toolset_names: List[str], action: str):
     """Add or remove built-in toolsets for a platform."""
-    enabled = _get_platform_tools(config, platform)
+    enabled = _get_platform_tools(config, platform, include_default_mcp_servers=False)
     if action == "disable":
         updated = enabled - set(toolset_names)
     else:
@@ -1426,7 +1479,7 @@ def tools_disable_enable_command(args):
         return
 
     if action == "list":
-        _print_tools_list(_get_platform_tools(config, platform),
+        _print_tools_list(_get_platform_tools(config, platform, include_default_mcp_servers=False),
                           config.get("mcp_servers") or {}, platform)
         return
 
