@@ -1,13 +1,52 @@
-# Git
+# ── Git / VCS ────────────────────────────────────────────────────────────────
+# .git is excluded from the build context (saves ~100MB+). At runtime the host
+# repo is bind-mounted at /opt/hermes-agent with full .git history.
 .git
-.gitignore
-.gitmodules
 
-# Dependencies
+# ── Python artifacts ─────────────────────────────────────────────────────────
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# ── Node artifacts ───────────────────────────────────────────────────────────
 node_modules
 
-# CI/CD
-.github
+# ── Docker build context exclusions ─────────────────────────────────────────
+hermes-data
+workspace
+docker-compose.yaml
+docker-compose.yml
 
-# Environment files
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode
+.idea
+*.swp
+*.swo
+
+# ── Logs and data ────────────────────────────────────────────────────────────
+logs
+data
+wandb
+testlogs
+tmp
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
+*.pem
+*.ppk
+
+# ── Large / unnecessary directories ─────────────────────────────────────────
+tinker-atropos
+website
+landingpage
+assets
+images
+docs/migration
