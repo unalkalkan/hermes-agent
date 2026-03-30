@@ -74,7 +74,11 @@ DEFAULT_ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_STREAMING_MODEL_ID = "eleven_flash_v2_5"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "alloy"
-DEFAULT_OUTPUT_DIR = str(get_hermes_home() / "audio_cache")
+def _get_default_output_dir() -> str:
+    from hermes_constants import get_hermes_dir
+    return str(get_hermes_dir("cache/audio", "audio_cache"))
+
+DEFAULT_OUTPUT_DIR = _get_default_output_dir()
 MAX_TEXT_LENGTH = 4000
 
 
@@ -102,7 +106,7 @@ def _load_tts_config() -> Dict[str, Any]:
 
 def _get_provider(tts_config: Dict[str, Any]) -> str:
     """Get the configured TTS provider name."""
-    return tts_config.get("provider", DEFAULT_PROVIDER).lower().strip()
+    return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
 
 
 # ===========================================================================
