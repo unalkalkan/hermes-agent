@@ -79,6 +79,39 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # Brave Search API key for bx-search skill (set in host env or compose .env)
       - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
+      # Preferred local Camofox API endpoint (same Docker network)
+      - CAMOFOX_BASE_URL=${CAMOFOX_BASE_URL:-http://camofox-browser:9377}
+
+    restart: unless-stopped
+
+  camofox-browser:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.camofox
+      args:
+        CAMOFOX_REPO: ${CAMOFOX_REPO:-https://github.com/jo-inc/camofox-browser}
+        CAMOFOX_REF: ${CAMOFOX_REF:-master}
+    container_name: camofox-browser
+    hostname: camofox-browser
+
+    # Keep browser server accessible from host and from hermes container
+    ports:
+      - "9377:9377"
+
+    environment:
+      - CAMOFOX_PORT=9377
+      - NODE_ENV=production
+      # Optional hardening / auth for cookie-import endpoint
+      - CAMOFOX_API_KEY=${CAMOFOX_API_KEY:-}
+      # Optional proxy routing (uncomment/set in .env when needed)
+      - PROXY_HOST=${PROXY_HOST:-}
+      - PROXY_PORT=${PROXY_PORT:-}
+      - PROXY_USERNAME=${PROXY_USERNAME:-}
+      - PROXY_PASSWORD=${PROXY_PASSWORD:-}
+
+    volumes:
+      # Persist Camoufox binaries/cache and cookie files across restarts/rebuilds
+      - ./hermes-data/camofox:/data/camofox
 
     restart: unless-stopped
 

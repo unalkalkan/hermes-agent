@@ -1,0 +1,71 @@
+# ==========================================================================
+# Camofox Browser service image (for Hermes docker-compose stack)
+# Builds a standalone anti-detection browser API server on port 9377.
+# ==========================================================================
+
+FROM node:22-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime deps required by Camoufox (Firefox-based)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    unzip \
+    python3 \
+    libgtk-3-0 \
+    libdbus-glib-1-2 \
+    libxt6 \
+    libasound2 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxi6 \
+    libxrandr2 \
+    libxrender1 \
+    libxss1 \
+    libxtst6 \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install latest yt-dlp directly from upstream (Debian apt version can be stale)
+RUN curl -L --fail --retry 3 https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp \
+    && /usr/local/bin/yt-dlp --version
+
+# Keep all runtime cache/cookies under a persistent mount point
+ENV HOME=/data/camofox
+RUN mkdir -p /data/camofox
+
+# Clone pinned source at build time for reproducibility
+ARG CAMOFOX_REPO=https://github.com/jo-inc/camofox-browser
+ARG CAMOFOX_REF=master
+RUN git clone --depth 1 --branch ${CAMOFOX_REF} ${CAMOFOX_REPO} /opt/camofox-browser
+
+WORKDIR /opt/camofox-browser
+
+# Installs node deps and runs postinstall (camoufox-js fetch)
+RUN npm install --omit=dev
+
+# Keep a baked-in seed copy; runtime entrypoint hydrates persistent volume on first boot
+RUN mkdir -p /opt/camoufox-seed && cp -a /data/camofox/.cache/camoufox/. /opt/camoufox-seed/
+
+# Ensure runtime dirs exist (cookie import + cache paths)
+RUN mkdir -p /data/camofox/.cache/camoufox /data/camofox/.camofox/cookies
+
+ENV CAMOFOX_PORT=9377
+EXPOSE 9377
+
+COPY docker/camofox-entrypoint.sh /usr/local/bin/camofox-entrypoint.sh
+RUN chmod +x /usr/local/bin/camofox-entrypoint.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD curl -fsS http://localhost:9377/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/camofox-entrypoint.sh"]
+CMD ["npm", "start"]
