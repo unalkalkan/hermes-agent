@@ -42,6 +42,7 @@ tmp
 !.env.example
 *.pem
 *.ppk
+.md
 
 # ── Large / unnecessary directories ─────────────────────────────────────────
 tinker-atropos

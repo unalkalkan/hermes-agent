@@ -94,7 +94,7 @@ ENV VIRTUAL_ENV=/opt/hermes-venv
 ENV PATH="/opt/hermes-venv/bin:$PATH"
 
 # Install the main package with all extras
-RUN uv pip install -e ".[all]" || uv pip install -e "."
+RUN uv pip install --no-cache-dir -e ".[all]" || uv pip install -e "."
 
 # Install mini-swe-agent if available
 RUN if [ -f "mini-swe-agent/pyproject.toml" ]; then \
@@ -102,10 +102,10 @@ RUN if [ -f "mini-swe-agent/pyproject.toml" ]; then \
     fi
 
 # Install Node.js deps (browser tools)
-RUN if [ -f "package.json" ]; then npm install --silent 2>/dev/null || true; fi
+RUN if [ -f "package.json" ]; then npm install --prefer-offline --no-audit --silent 2>/dev/null || true; fi
 
 # Install Playwright Chromium for browser automation
-RUN npx playwright install --with-deps chromium 2>/dev/null || true
+RUN npx playwright install --with-deps chromium --only-shell 2>/dev/null || true
 
 # ── HERMES_HOME → /data/hermes (mounted volume) ─────────────────────────────
 ENV HERMES_HOME=/data/hermes
