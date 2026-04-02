@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /data/hermes/skills/cloudflare/cloudflare-tunnel/scripts/reconcile-managed.sh "$@"

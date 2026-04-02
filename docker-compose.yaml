@@ -79,6 +79,11 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # Brave Search API key for bx-search skill (set in host env or compose .env)
       - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
+      # Cloudflare API token for Wrangler/Cloudflare skills
+      - CLOUDFLARE_TOKEN=${CLOUDFLARE_TOKEN:-}
+      # Cloudflare account/zone defaults for tunnel automation scripts
+      - CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
+      - CF_ZONE_ID=${CF_ZONE_ID:-}
       # Preferred local Camofox API endpoint (same Docker network)
       - CAMOFOX_BASE_URL=${CAMOFOX_BASE_URL:-http://camofox-browser:9377}
 
