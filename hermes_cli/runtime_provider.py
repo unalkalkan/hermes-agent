@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
@@ -258,6 +261,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
     config = load_config()
     custom_providers = config.get("custom_providers")
     if not isinstance(custom_providers, list):
+        if isinstance(custom_providers, dict):
+            logger.warning(
+                "custom_providers in config.yaml is a dict, not a list. "
+                "Each entry must be prefixed with '-' in YAML. "
+                "Run 'hermes doctor' for details."
+            )
         return None
 
     for entry in custom_providers:
@@ -377,9 +386,13 @@ def _resolve_openrouter_runtime(
         ]
     else:
         # Custom endpoint: use api_key from config when using config base_url (#1760).
+        # When the endpoint is Ollama Cloud, check OLLAMA_API_KEY — it's
+        # the canonical env var for ollama.com authentication.
+        _is_ollama_url = "ollama.com" in base_url.lower()
         api_key_candidates = [
             explicit_api_key,
             (cfg_api_key if use_config_base_url else ""),
+            (os.getenv("OLLAMA_API_KEY") if _is_ollama_url else ""),
             os.getenv("OPENAI_API_KEY"),
             os.getenv("OPENROUTER_API_KEY"),
         ]

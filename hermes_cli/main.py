@@ -142,6 +142,13 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 load_hermes_dotenv(project_env=PROJECT_ROOT / '.env')
 
+# Initialize centralized file logging early — all `hermes` subcommands
+# (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
+try:
+    from hermes_logging import setup_logging as _setup_logging
+    _setup_logging(mode="cli")
+except Exception:
+    pass  # best-effort — don't crash the CLI if logging setup fails
 
 import logging
 import time as _time
@@ -1088,10 +1095,13 @@ def _model_flow_openrouter(config, current_model=""):
         print("API key saved.")
         print()
 
-    from hermes_cli.models import model_ids
+    from hermes_cli.models import model_ids, get_pricing_for_provider
     openrouter_models = model_ids()
 
-    selected = _prompt_model_selection(openrouter_models, current_model=current_model)
+    # Fetch live pricing (non-blocking — returns empty dict on failure)
+    pricing = get_pricing_for_provider("openrouter")
+
+    selected = _prompt_model_selection(openrouter_models, current_model=current_model, pricing=pricing)
     if selected:
         _save_model_choice(selected)
 
@@ -1158,7 +1168,7 @@ def _model_flow_nous(config, current_model="", args=None):
     # Already logged in — use curated model list (same as OpenRouter defaults).
     # The live /models endpoint returns hundreds of models; the curated list
     # shows only agentic models users recognize from OpenRouter.
-    from hermes_cli.models import _PROVIDER_MODELS
+    from hermes_cli.models import _PROVIDER_MODELS, get_pricing_for_provider
     model_ids = _PROVIDER_MODELS.get("nous", [])
     if not model_ids:
         print("No curated models available for Nous Portal.")
@@ -1188,7 +1198,10 @@ def _model_flow_nous(config, current_model="", args=None):
         print(f"Could not verify credentials: {msg}")
         return
 
-    selected = _prompt_model_selection(model_ids, current_model=current_model)
+    # Fetch live pricing (non-blocking — returns empty dict on failure)
+    pricing = get_pricing_for_provider("nous")
+
+    selected = _prompt_model_selection(model_ids, current_model=current_model, pricing=pricing)
     if selected:
         _save_model_choice(selected)
         # Reactivate Nous as the provider and update config
@@ -2554,6 +2567,57 @@ def _clear_bytecode_cache(root: Path) -> int:
     return removed
 
 
+def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
+    """File-based IPC prompt for gateway mode.
+
+    Writes a prompt marker file so the gateway can forward the question to the
+    user, then polls for a response file.  Falls back to *default* on timeout.
+
+    Used by ``hermes update --gateway`` so interactive prompts (stash restore,
+    config migration) are forwarded to the messenger instead of being silently
+    skipped.
+    """
+    import json as _json
+    import uuid as _uuid
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    prompt_path = home / ".update_prompt.json"
+    response_path = home / ".update_response"
+
+    # Clean any stale response file
+    response_path.unlink(missing_ok=True)
+
+    payload = {
+        "prompt": prompt_text,
+        "default": default,
+        "id": str(_uuid.uuid4()),
+    }
+    tmp = prompt_path.with_suffix(".tmp")
+    tmp.write_text(_json.dumps(payload))
+    tmp.replace(prompt_path)
+
+    # Poll for response
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if response_path.exists():
+            try:
+                answer = response_path.read_text().strip()
+                response_path.unlink(missing_ok=True)
+                prompt_path.unlink(missing_ok=True)
+                return answer if answer else default
+            except (OSError, ValueError):
+                pass
+        _time.sleep(0.5)
+
+    # Timeout — clean up and use default
+    prompt_path.unlink(missing_ok=True)
+    response_path.unlink(missing_ok=True)
+    print(f"  (no response after {int(timeout)}s, using default: {default!r})")
+    return default
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
     
@@ -2747,6 +2811,7 @@ def _restore_stashed_changes(
     cwd: Path,
     stash_ref: str,
     prompt_user: bool = False,
+    input_fn=None,
 ) -> bool:
     if prompt_user:
         print()
@@ -2754,7 +2819,10 @@ def _restore_stashed_changes(
         print("  Restoring them may reapply local customizations onto the updated codebase.")
         print("  Review the result afterward if Hermes behaves unexpectedly.")
         print("Restore local changes now? [Y/n]")
-        response = input().strip().lower()
+        if input_fn is not None:
+            response = input_fn("Restore local changes now? [Y/n]", "y")
+        else:
+            response = input().strip().lower()
         if response not in ("", "y", "yes"):
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
@@ -3218,6 +3286,10 @@ def cmd_update(args):
     if is_managed():
         managed_error("update Hermes Agent")
         return
+
+    gateway_mode = getattr(args, "gateway", False)
+    # In gateway mode, use file-based IPC for prompts instead of stdin
+    gw_input_fn = (lambda prompt, default="": _gateway_prompt(prompt, default)) if gateway_mode else None
     
     print("⚕ Updating Hermes Agent...")
     print()
@@ -3314,7 +3386,9 @@ def cmd_update(args):
         else:
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
-        prompt_for_restore = auto_stash_ref is not None and sys.stdin.isatty() and sys.stdout.isatty()
+        prompt_for_restore = auto_stash_ref is not None and (
+            gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
+        )
 
         # Check if there are updates
         result = subprocess.run(
@@ -3333,6 +3407,7 @@ def cmd_update(args):
                 _restore_stashed_changes(
                     git_cmd, PROJECT_ROOT, auto_stash_ref,
                     prompt_user=prompt_for_restore,
+                    input_fn=gw_input_fn,
                 )
             if current_branch not in ("main", "HEAD"):
                 subprocess.run(
@@ -3384,6 +3459,7 @@ def cmd_update(args):
                         PROJECT_ROOT,
                         auto_stash_ref,
                         prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
                     )
         
         _invalidate_update_cache()
@@ -3523,7 +3599,11 @@ def cmd_update(args):
                 print(f"  ℹ️  {len(missing_config)} new config option(s) available")
             
             print()
-            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            if gateway_mode:
+                response = _gateway_prompt(
+                    "Would you like to configure new options now? [Y/n]", "n"
+                ).strip().lower()
+            elif not (sys.stdin.isatty() and sys.stdout.isatty()):
                 print("  ℹ Non-interactive session — skipping config migration prompt.")
                 print("    Run 'hermes config migrate' later to apply any new config/env options.")
                 response = "n"
@@ -3535,11 +3615,15 @@ def cmd_update(args):
             
             if response in ('', 'y', 'yes'):
                 print()
-                results = migrate_config(interactive=True, quiet=False)
+                # In gateway mode, run auto-migrations only (no input() prompts
+                # for API keys which would hang the detached process).
+                results = migrate_config(interactive=not gateway_mode, quiet=False)
                 
                 if results["env_added"] or results["config_added"]:
                     print()
                     print("✓ Configuration updated!")
+                if gateway_mode and missing_env:
+                    print("  ℹ API keys require manual entry: hermes config migrate")
             else:
                 print()
                 print("Skipped. Run 'hermes config migrate' later to configure.")
@@ -3556,6 +3640,7 @@ def cmd_update(args):
             from hermes_cli.gateway import (
                 is_macos, is_linux, _ensure_user_systemd_env,
                 get_systemd_linger_status, find_gateway_pids,
+                _get_service_pids,
             )
             import signal as _signal
 
@@ -3622,8 +3707,11 @@ def cmd_update(args):
                     pass
 
             # --- Manual (non-service) gateways ---
-            # Kill any remaining gateway processes not managed by a service
-            manual_pids = find_gateway_pids()
+            # Kill any remaining gateway processes not managed by a service.
+            # Exclude PIDs that belong to just-restarted services so we don't
+            # immediately kill the process that systemd/launchd just spawned.
+            service_pids = _get_service_pids()
+            manual_pids = find_gateway_pids(exclude_pids=service_pids)
             for pid in manual_pids:
                 try:
                     os.kill(pid, _signal.SIGTERM)
@@ -3959,6 +4047,26 @@ def cmd_completion(args):
         print(generate_bash_completion())
 
 
+def cmd_logs(args):
+    """View and filter Hermes log files."""
+    from hermes_cli.logs import tail_log, list_logs
+
+    log_name = getattr(args, "log_name", "agent") or "agent"
+
+    if log_name == "list":
+        list_logs()
+        return
+
+    tail_log(
+        log_name,
+        num_lines=getattr(args, "lines", 50),
+        follow=getattr(args, "follow", False),
+        level=getattr(args, "level", None),
+        session=getattr(args, "session", None),
+        since=getattr(args, "since", None),
+    )
+
+
 def main():
     """Main entry point for hermes CLI."""
     parser = argparse.ArgumentParser(
@@ -3976,7 +4084,7 @@ Examples:
     hermes logout                 Clear stored authentication
     hermes auth add <provider>    Add a pooled credential
     hermes auth list              List pooled credentials
-    hermes auth remove <p> <n>    Remove pooled credential by index
+    hermes auth remove <p> <t>    Remove pooled credential by index, id, or label
     hermes auth reset <provider>  Clear exhaustion status for a provider
     hermes model                  Select default model
     hermes config                 View configuration
@@ -3989,6 +4097,10 @@ Examples:
     hermes sessions list          List past sessions
     hermes sessions browse        Interactive session picker
     hermes sessions rename ID T   Rename/title a session
+    hermes logs                   View agent.log (last 50 lines)
+    hermes logs -f                Follow agent.log in real time
+    hermes logs errors            View errors.log
+    hermes logs --since 1h        Lines from the last hour
     hermes update                 Update to latest version
 
 For more help on a command:
@@ -4066,7 +4178,7 @@ For more help on a command:
     chat_parser.add_argument(
         "-s", "--skills",
         action="append",
-        default=None,
+        default=argparse.SUPPRESS,
         help="Preload one or more skills for the session (repeat flag or comma-separate)"
     )
     chat_parser.add_argument(
@@ -4088,6 +4200,7 @@ For more help on a command:
     chat_parser.add_argument(
         "--resume", "-r",
         metavar="SESSION_ID",
+        default=argparse.SUPPRESS,
         help="Resume a previous session by ID (shown on exit)"
     )
     chat_parser.add_argument(
@@ -4095,14 +4208,14 @@ For more help on a command:
         dest="continue_last",
         nargs="?",
         const=True,
-        default=None,
+        default=argparse.SUPPRESS,
         metavar="SESSION_NAME",
         help="Resume a session by name, or the most recent if no name given"
     )
     chat_parser.add_argument(
         "--worktree", "-w",
         action="store_true",
-        default=False,
+        default=argparse.SUPPRESS,
         help="Run in an isolated git worktree (for parallel agents on the same repo)"
     )
     chat_parser.add_argument(
@@ -4121,13 +4234,13 @@ For more help on a command:
     chat_parser.add_argument(
         "--yolo",
         action="store_true",
-        default=False,
+        default=argparse.SUPPRESS,
         help="Bypass all dangerous command approval prompts (use at your own risk)"
     )
     chat_parser.add_argument(
         "--pass-session-id",
         action="store_true",
-        default=False,
+        default=argparse.SUPPRESS,
         help="Include the session ID in the agent's system prompt"
     )
     chat_parser.add_argument(
@@ -4365,9 +4478,9 @@ For more help on a command:
     auth_add.add_argument("--ca-bundle", help="Custom CA bundle for OAuth login")
     auth_list = auth_subparsers.add_parser("list", help="List pooled credentials")
     auth_list.add_argument("provider", nargs="?", help="Optional provider filter")
-    auth_remove = auth_subparsers.add_parser("remove", help="Remove a pooled credential by index")
+    auth_remove = auth_subparsers.add_parser("remove", help="Remove a pooled credential by index, id, or label")
     auth_remove.add_argument("provider", help="Provider id")
-    auth_remove.add_argument("index", type=int, help="1-based credential index")
+    auth_remove.add_argument("target", help="Credential index, entry id, or exact label")
     auth_reset = auth_subparsers.add_parser("reset", help="Clear exhaustion status for all credentials for a provider")
     auth_reset.add_argument("provider", help="Provider id")
     auth_parser.set_defaults(func=cmd_auth)
@@ -4414,6 +4527,7 @@ For more help on a command:
     cron_create.add_argument("--deliver", help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id")
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument("--skill", dest="skills", action="append", help="Attach a skill. Repeat to add multiple skills.")
+    cron_create.add_argument("--script", help="Path to a Python script whose stdout is injected into the prompt each run")
 
     # cron edit
     cron_edit = cron_subparsers.add_parser("edit", help="Edit an existing scheduled job")
@@ -4427,6 +4541,7 @@ For more help on a command:
     cron_edit.add_argument("--add-skill", dest="add_skills", action="append", help="Append a skill without replacing the existing list. Repeatable.")
     cron_edit.add_argument("--remove-skill", dest="remove_skills", action="append", help="Remove a specific attached skill. Repeatable.")
     cron_edit.add_argument("--clear-skills", action="store_true", help="Remove all attached skills from the job")
+    cron_edit.add_argument("--script", help="Path to a Python script whose stdout is injected into the prompt each run. Pass empty string to clear.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
@@ -4691,106 +4806,23 @@ For more help on a command:
     plugins_parser.set_defaults(func=cmd_plugins)
 
     # =========================================================================
-    # honcho command — Honcho-specific config (peer, mode, tokens, profiles)
-    # Provider selection happens via 'hermes memory setup'.
+    # Plugin CLI commands — dynamically registered by memory/general plugins.
+    # Plugins provide a register_cli(subparser) function that builds their
+    # own argparse tree.  No hardcoded plugin commands in main.py.
     # =========================================================================
-    honcho_parser = subparsers.add_parser(
-        "honcho",
-        help="Manage Honcho memory provider config (peer, mode, profiles)",
-        description=(
-            "Configure Honcho-specific settings. Honcho is now a memory provider\n"
-            "plugin — initial setup is via 'hermes memory setup'. These commands\n"
-            "manage Honcho's own config: peer names, memory mode, token budgets,\n"
-            "per-profile host blocks, and cross-profile observability."
-        ),
-        formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
-    )
-    honcho_parser.add_argument(
-        "--target-profile", metavar="NAME", dest="target_profile",
-        help="Target a specific profile's Honcho config without switching",
-    )
-    honcho_subparsers = honcho_parser.add_subparsers(dest="honcho_command")
-
-    honcho_subparsers.add_parser("setup", help="Initial Honcho setup (redirects to hermes memory setup)")
-    honcho_status = honcho_subparsers.add_parser("status", help="Show current Honcho config and connection status")
-    honcho_status.add_argument("--all", action="store_true", help="Show config overview across all profiles")
-    honcho_subparsers.add_parser("peers", help="Show peer identities across all profiles")
-    honcho_subparsers.add_parser("sessions", help="List known Honcho session mappings")
-
-    honcho_map = honcho_subparsers.add_parser(
-        "map", help="Map current directory to a Honcho session name (no arg = list mappings)"
-    )
-    honcho_map.add_argument(
-        "session_name", nargs="?", default=None,
-        help="Session name to associate with this directory. Omit to list current mappings.",
-    )
-
-    honcho_peer = honcho_subparsers.add_parser(
-        "peer", help="Show or update peer names and dialectic reasoning level"
-    )
-    honcho_peer.add_argument("--user", metavar="NAME", help="Set user peer name")
-    honcho_peer.add_argument("--ai", metavar="NAME", help="Set AI peer name")
-    honcho_peer.add_argument(
-        "--reasoning",
-        metavar="LEVEL",
-        choices=("minimal", "low", "medium", "high", "max"),
-        help="Set default dialectic reasoning level (minimal/low/medium/high/max)",
-    )
-
-    honcho_mode = honcho_subparsers.add_parser(
-        "mode", help="Show or set memory mode (hybrid/honcho/local)"
-    )
-    honcho_mode.add_argument(
-        "mode", nargs="?", metavar="MODE",
-        choices=("hybrid", "honcho", "local"),
-        help="Memory mode to set (hybrid/honcho/local). Omit to show current.",
-    )
-
-    honcho_tokens = honcho_subparsers.add_parser(
-        "tokens", help="Show or set token budget for context and dialectic"
-    )
-    honcho_tokens.add_argument(
-        "--context", type=int, metavar="N",
-        help="Max tokens Honcho returns from session.context() per turn",
-    )
-    honcho_tokens.add_argument(
-        "--dialectic", type=int, metavar="N",
-        help="Max chars of dialectic result to inject into system prompt",
-    )
-
-    honcho_identity = honcho_subparsers.add_parser(
-        "identity", help="Seed or show the AI peer's Honcho identity representation"
-    )
-    honcho_identity.add_argument(
-        "file", nargs="?", default=None,
-        help="Path to file to seed from (e.g. SOUL.md). Omit to show usage.",
-    )
-    honcho_identity.add_argument(
-        "--show", action="store_true",
-        help="Show current AI peer representation from Honcho",
-    )
-
-    honcho_subparsers.add_parser(
-        "migrate",
-        help="Step-by-step migration guide from openclaw-honcho to Hermes Honcho",
-    )
-    honcho_subparsers.add_parser("enable", help="Enable Honcho for the active profile")
-    honcho_subparsers.add_parser("disable", help="Disable Honcho for the active profile")
-    honcho_subparsers.add_parser("sync", help="Sync Honcho config to all existing profiles")
-
-    def cmd_honcho(args):
-        sub = getattr(args, "honcho_command", None)
-        if sub == "setup":
-            # Redirect to the generic memory setup
-            print("\n  Honcho is now configured via the memory provider system.")
-            print("  Running 'hermes memory setup'...\n")
-            from hermes_cli.memory_setup import memory_command
-            memory_command(args)
-            return
-        from plugins.memory.honcho.cli import honcho_command
-        honcho_command(args)
-
-    honcho_parser.set_defaults(func=cmd_honcho)
+    try:
+        from plugins.memory import discover_plugin_cli_commands
+        for cmd_info in discover_plugin_cli_commands():
+            plugin_parser = subparsers.add_parser(
+                cmd_info["name"],
+                help=cmd_info["help"],
+                description=cmd_info.get("description", ""),
+                formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+            )
+            cmd_info["setup_fn"](plugin_parser)
+    except Exception as _exc:
+        import logging as _log
+        _log.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
     # =========================================================================
     # memory command
@@ -5277,6 +5309,10 @@ For more help on a command:
         help="Update Hermes Agent to the latest version",
         description="Pull the latest changes from git and reinstall dependencies"
     )
+    update_parser.add_argument(
+        "--gateway", action="store_true", default=False,
+        help="Gateway mode: use file-based IPC for prompts instead of stdin (used internally by /update)"
+    )
     update_parser.set_defaults(func=cmd_update)
     
     # =========================================================================
@@ -5387,6 +5423,53 @@ For more help on a command:
         help="Shell type (default: bash)",
     )
     completion_parser.set_defaults(func=cmd_completion)
+
+    # =========================================================================
+    # logs command
+    # =========================================================================
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="View and filter Hermes log files",
+        description="View, tail, and filter agent.log / errors.log / gateway.log",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+    hermes logs                    Show last 50 lines of agent.log
+    hermes logs -f                 Follow agent.log in real time
+    hermes logs errors             Show last 50 lines of errors.log
+    hermes logs gateway -n 100     Show last 100 lines of gateway.log
+    hermes logs --level WARNING    Only show WARNING and above
+    hermes logs --session abc123   Filter by session ID
+    hermes logs --since 1h         Lines from the last hour
+    hermes logs --since 30m -f     Follow, starting from 30 min ago
+    hermes logs list               List available log files with sizes
+""",
+    )
+    logs_parser.add_argument(
+        "log_name", nargs="?", default="agent",
+        help="Log to view: agent (default), errors, gateway, or 'list' to show available files",
+    )
+    logs_parser.add_argument(
+        "-n", "--lines", type=int, default=50,
+        help="Number of lines to show (default: 50)",
+    )
+    logs_parser.add_argument(
+        "-f", "--follow", action="store_true",
+        help="Follow the log in real time (like tail -f)",
+    )
+    logs_parser.add_argument(
+        "--level", metavar="LEVEL",
+        help="Minimum log level to show (DEBUG, INFO, WARNING, ERROR)",
+    )
+    logs_parser.add_argument(
+        "--session", metavar="ID",
+        help="Filter lines containing this session ID substring",
+    )
+    logs_parser.add_argument(
+        "--since", metavar="TIME",
+        help="Show lines since TIME ago (e.g. 1h, 30m, 2d)",
+    )
+    logs_parser.set_defaults(func=cmd_logs)
 
     # =========================================================================
     # Parse and execute
