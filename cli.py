@@ -120,6 +120,63 @@ def _parse_reasoning_config(effort: str) -> dict | None:
     return result
 
 
+def _get_chrome_debug_candidates(system: str) -> list[str]:
+    """Return likely browser executables for local CDP auto-launch."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add_candidate(path: str | None) -> None:
+        if not path:
+            return
+        normalized = os.path.normcase(os.path.normpath(path))
+        if normalized in seen:
+            return
+        if os.path.isfile(path):
+            candidates.append(path)
+            seen.add(normalized)
+
+    def _add_from_path(*names: str) -> None:
+        for name in names:
+            _add_candidate(shutil.which(name))
+
+    if system == "Darwin":
+        for app in (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ):
+            _add_candidate(app)
+    elif system == "Windows":
+        _add_from_path(
+            "chrome.exe", "msedge.exe", "brave.exe", "chromium.exe",
+            "chrome", "msedge", "brave", "chromium",
+        )
+
+        for base in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ):
+            if not base:
+                continue
+            for parts in (
+                ("Google", "Chrome", "Application", "chrome.exe"),
+                ("Chromium", "Application", "chrome.exe"),
+                ("Chromium", "Application", "chromium.exe"),
+                ("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                ("Microsoft", "Edge", "Application", "msedge.exe"),
+            ):
+                _add_candidate(os.path.join(base, *parts))
+    else:
+        _add_from_path(
+            "google-chrome", "google-chrome-stable", "chromium-browser",
+            "chromium", "brave-browser", "microsoft-edge",
+        )
+
+    return candidates
+
+
 def load_cli_config() -> Dict[str, Any]:
     """
     Load CLI configuration from config files.
@@ -1863,6 +1920,12 @@ class HermesCLI:
             _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
             self._reasoning_box_opened = False
 
+            # Flush any content that was deferred while reasoning was rendering.
+            deferred = getattr(self, "_deferred_content", "")
+            if deferred:
+                self._deferred_content = ""
+                self._emit_stream_text(deferred)
+
     def _stream_delta(self, text) -> None:
         """Line-buffered streaming callback for real-time token rendering.
 
@@ -1965,6 +2028,13 @@ class HermesCLI:
         if not text:
             return
 
+        # When show_reasoning is on and reasoning is still rendering,
+        # defer content until the reasoning box closes.  This ensures the
+        # reasoning block always appears BEFORE the response in the terminal.
+        if self.show_reasoning and getattr(self, "_reasoning_box_opened", False):
+            self._deferred_content = getattr(self, "_deferred_content", "") + text
+            return
+
         # Close the live reasoning box before opening the response box
         self._close_reasoning_box()
 
@@ -2031,6 +2101,7 @@ class HermesCLI:
         self._reasoning_box_opened = False
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
+        self._deferred_content = ""
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -3721,7 +3792,7 @@ class HermesCLI:
 
         # Persistence
         if persist_global:
-            save_config_value("model.name", result.new_model)
+            save_config_value("model.default", result.new_model)
             if result.provider_changed:
                 save_config_value("model.provider", result.target_provider)
             _cprint("    Saved to config.yaml (--global)")
@@ -4838,27 +4909,9 @@ class HermesCLI:
 
         Returns True if a launch command was executed (doesn't guarantee success).
         """
-        import shutil
         import subprocess as _sp
 
-        candidates = []
-        if system == "Darwin":
-            # macOS: try common app bundle locations
-            for app in (
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Chromium.app/Contents/MacOS/Chromium",
-                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            ):
-                if os.path.isfile(app):
-                    candidates.append(app)
-        else:
-            # Linux: try common binary names
-            for name in ("google-chrome", "google-chrome-stable", "chromium-browser",
-                         "chromium", "brave-browser", "microsoft-edge"):
-                path = shutil.which(name)
-                if path:
-                    candidates.append(path)
+        candidates = _get_chrome_debug_candidates(system)
 
         if not candidates:
             return False
@@ -7469,18 +7522,26 @@ class HermesCLI:
         # wrapping of long lines so the input area always fits its content.
         def _input_height():
             try:
+                from prompt_toolkit.application import get_app
+                from prompt_toolkit.utils import get_cwidth
+
                 doc = input_area.buffer.document
-                prompt_width = max(2, len(self._get_tui_prompt_text()))
-                available_width = shutil.get_terminal_size().columns - prompt_width
+                prompt_width = max(2, get_cwidth(self._get_tui_prompt_text()))
+                try:
+                    available_width = get_app().output.get_size().columns - prompt_width
+                except Exception:
+                    available_width = shutil.get_terminal_size((80, 24)).columns - prompt_width
                 if available_width < 10:
                     available_width = 40
                 visual_lines = 0
                 for line in doc.lines:
-                    # Each logical line takes at least 1 visual row; long lines wrap
-                    if len(line) == 0:
+                    # Each logical line takes at least 1 visual row; long lines wrap.
+                    # Use prompt_toolkit's cell width so CJK wide characters count as 2.
+                    line_width = get_cwidth(line)
+                    if line_width <= 0:
                         visual_lines += 1
                     else:
-                        visual_lines += max(1, -(-len(line) // available_width))  # ceil division
+                        visual_lines += max(1, -(-line_width // available_width))  # ceil division
                 return min(max(visual_lines, 1), 8)
             except Exception:
                 return 1
@@ -8073,6 +8134,25 @@ class HermesCLI:
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
                             self._check_config_mcp_changes()
+                            # Check for background process completion notifications
+                            # while the agent is idle (user hasn't typed anything yet).
+                            try:
+                                from tools.process_registry import process_registry
+                                if not process_registry.completion_queue.empty():
+                                    completion = process_registry.completion_queue.get_nowait()
+                                    _exit = completion.get("exit_code", "?")
+                                    _cmd = completion.get("command", "unknown")
+                                    _sid = completion.get("session_id", "unknown")
+                                    _out = completion.get("output", "")
+                                    _synth = (
+                                        f"[SYSTEM: Background process {_sid} completed "
+                                        f"(exit code {_exit}).\n"
+                                        f"Command: {_cmd}\n"
+                                        f"Output:\n{_out}]"
+                                    )
+                                    self._pending_input.put(_synth)
+                            except Exception:
+                                pass
                         continue
                     
                     if not user_input:
@@ -8186,7 +8266,29 @@ class HermesCLI:
                                 except Exception as e:
                                     _cprint(f"{_DIM}Voice auto-restart failed: {e}{_RST}")
                             threading.Thread(target=_restart_recording, daemon=True).start()
-                    
+
+                        # Drain process completion notifications — any background
+                        # process that finished with notify_on_complete while the
+                        # agent was running (or before) gets auto-injected as a
+                        # new user message so the agent can react to it.
+                        try:
+                            from tools.process_registry import process_registry
+                            while not process_registry.completion_queue.empty():
+                                completion = process_registry.completion_queue.get_nowait()
+                                _exit = completion.get("exit_code", "?")
+                                _cmd = completion.get("command", "unknown")
+                                _sid = completion.get("session_id", "unknown")
+                                _out = completion.get("output", "")
+                                _synth = (
+                                    f"[SYSTEM: Background process {_sid} completed "
+                                    f"(exit code {_exit}).\n"
+                                    f"Command: {_cmd}\n"
+                                    f"Output:\n{_out}]"
+                                )
+                                self._pending_input.put(_synth)
+                        except Exception:
+                            pass  # Non-fatal — don't break the main loop
+
                 except Exception as e:
                     print(f"Error: {e}")
         

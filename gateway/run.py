@@ -1127,6 +1127,7 @@ class GatewayRunner:
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+            adapter.set_session_store(self.session_store)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -1424,6 +1425,7 @@ class GatewayRunner:
 
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+                    adapter.set_session_store(self.session_store)
 
                     success = await adapter.connect()
                     if success:
@@ -3244,7 +3246,7 @@ class GatewayRunner:
             old_entry = self.session_store._entries.get(session_key)
             if old_entry:
                 _flush_task = asyncio.create_task(
-                    self._async_flush_memories(old_entry.session_id, session_key)
+                    self._async_flush_memories(old_entry.session_id)
                 )
                 self._background_tasks.add(_flush_task)
                 _flush_task.add_done_callback(self._background_tasks.discard)
@@ -3252,8 +3254,24 @@ class GatewayRunner:
             logger.debug("Gateway memory flush on reset failed: %s", e)
         self._evict_cached_agent(session_key)
         
+        try:
+            from tools.env_passthrough import clear_env_passthrough
+            clear_env_passthrough()
+        except Exception:
+            pass
+
+        try:
+            from tools.credential_files import clear_credential_files
+            clear_credential_files()
+        except Exception:
+            pass
+
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
+
+        # Clear any session-scoped model override so the next agent picks up
+        # the configured default instead of the previously switched model.
+        self._session_model_overrides.pop(session_key, None)
 
         # Emit session:end hook (session is ending)
         await self.hooks.emit("session:end", {
@@ -3446,11 +3464,11 @@ class GatewayRunner:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
     
-    async def _handle_model_command(self, event: MessageEvent) -> str:
+    async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 
         Supports:
-          /model                              — show current model info
+          /model                              — interactive picker (Telegram/Discord) or text list
           /model <name>                       — switch for this session only
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
@@ -3481,7 +3499,7 @@ class GatewayRunner:
                     cfg = yaml.safe_load(f) or {}
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("name", "")
+                    current_model = model_cfg.get("default", "")
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
@@ -3498,8 +3516,118 @@ class GatewayRunner:
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
 
-        # No args: show authenticated providers with models
+        # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
+            # Try interactive picker if the platform supports it
+            adapter = self.adapters.get(source.platform)
+            has_picker = (
+                adapter is not None
+                and getattr(type(adapter), "send_model_picker", None) is not None
+            )
+
+            if has_picker:
+                try:
+                    providers = list_authenticated_providers(
+                        current_provider=current_provider,
+                        user_providers=user_provs,
+                        max_models=50,
+                    )
+                except Exception:
+                    providers = []
+
+                if providers:
+                    # Build a callback closure for when the user picks a model.
+                    # Captures self + locals needed for the switch logic.
+                    _self = self
+                    _session_key = session_key
+                    _cur_model = current_model
+                    _cur_provider = current_provider
+                    _cur_base_url = current_base_url
+                    _cur_api_key = current_api_key
+
+                    async def _on_model_selected(
+                        _chat_id: str, model_id: str, provider_slug: str
+                    ) -> str:
+                        """Perform the model switch and return confirmation text."""
+                        result = _switch_model(
+                            raw_input=model_id,
+                            current_provider=_cur_provider,
+                            current_model=_cur_model,
+                            current_base_url=_cur_base_url,
+                            current_api_key=_cur_api_key,
+                            is_global=False,
+                            explicit_provider=provider_slug,
+                        )
+                        if not result.success:
+                            return f"Error: {result.error_message}"
+
+                        # Update cached agent in-place
+                        cached_entry = None
+                        _cache_lock = getattr(_self, "_agent_cache_lock", None)
+                        _cache = getattr(_self, "_agent_cache", None)
+                        if _cache_lock and _cache is not None:
+                            with _cache_lock:
+                                cached_entry = _cache.get(_session_key)
+                        if cached_entry and cached_entry[0] is not None:
+                            try:
+                                cached_entry[0].switch_model(
+                                    new_model=result.new_model,
+                                    new_provider=result.target_provider,
+                                    api_key=result.api_key,
+                                    base_url=result.base_url,
+                                    api_mode=result.api_mode,
+                                )
+                            except Exception as exc:
+                                logger.warning("Picker model switch failed for cached agent: %s", exc)
+
+                        # Store model note + session override
+                        if not hasattr(_self, "_pending_model_notes"):
+                            _self._pending_model_notes = {}
+                        _self._pending_model_notes[_session_key] = (
+                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
+                            f"via {result.provider_label or result.target_provider}. "
+                            f"Adjust your self-identification accordingly.]"
+                        )
+                        if not hasattr(_self, "_session_model_overrides"):
+                            _self._session_model_overrides = {}
+                        _self._session_model_overrides[_session_key] = {
+                            "model": result.new_model,
+                            "provider": result.target_provider,
+                            "api_key": result.api_key,
+                            "base_url": result.base_url,
+                            "api_mode": result.api_mode,
+                        }
+
+                        # Build confirmation text
+                        plabel = result.provider_label or result.target_provider
+                        lines = [f"Model switched to `{result.new_model}`"]
+                        lines.append(f"Provider: {plabel}")
+                        mi = result.model_info
+                        if mi:
+                            if mi.context_window:
+                                lines.append(f"Context: {mi.context_window:,} tokens")
+                            if mi.max_output:
+                                lines.append(f"Max output: {mi.max_output:,} tokens")
+                            if mi.has_cost_data():
+                                lines.append(f"Cost: {mi.format_cost()}")
+                            lines.append(f"Capabilities: {mi.format_capabilities()}")
+                        lines.append("_(session only — use `/model <name> --global` to persist)_")
+                        return "\n".join(lines)
+
+                    metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                    result = await adapter.send_model_picker(
+                        chat_id=source.chat_id,
+                        providers=providers,
+                        current_model=current_model,
+                        current_provider=current_provider,
+                        session_key=session_key,
+                        on_model_selected=_on_model_selected,
+                        metadata=metadata,
+                    )
+                    if result.success:
+                        return None  # Picker sent — adapter handles the response
+
+            # Fallback: text list (for platforms without picker or if picker failed)
             provider_label = get_label(current_provider)
             lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", ""]
 
@@ -3591,7 +3719,7 @@ class GatewayRunner:
                 else:
                     cfg = {}
                 model_cfg = cfg.setdefault("model", {})
-                model_cfg["name"] = result.new_model
+                model_cfg["default"] = result.new_model
                 model_cfg["provider"] = result.target_provider
                 if result.base_url:
                     model_cfg["base_url"] = result.base_url
@@ -4974,7 +5102,7 @@ class GatewayRunner:
         # Flush memories for current session before switching
         try:
             _flush_task = asyncio.create_task(
-                self._async_flush_memories(current_entry.session_id, session_key)
+                self._async_flush_memories(current_entry.session_id)
             )
             self._background_tasks.add(_flush_task)
             _flush_task.add_done_callback(self._background_tasks.discard)
@@ -5920,12 +6048,13 @@ class GatewayRunner:
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
+        agent_notify = watcher.get("notify_on_complete", False)
         notify_mode = self._load_background_notifications_mode()
 
-        logger.debug("Process watcher started: %s (every %ss, notify=%s)",
-                      session_id, interval, notify_mode)
+        logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
+                      session_id, interval, notify_mode, agent_notify)
 
-        if notify_mode == "off":
+        if notify_mode == "off" and not agent_notify:
             # Still wait for the process to exit so we can log it, but don't
             # push any messages to the user.
             while True:
@@ -5949,6 +6078,47 @@ class GatewayRunner:
             last_output_len = current_output_len
 
             if session.exited:
+                # --- Agent-triggered completion: inject synthetic message ---
+                if agent_notify:
+                    from tools.ansi_strip import strip_ansi
+                    _out = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+                    synth_text = (
+                        f"[SYSTEM: Background process {session_id} completed "
+                        f"(exit code {session.exit_code}).\n"
+                        f"Command: {session.command}\n"
+                        f"Output:\n{_out}]"
+                    )
+                    adapter = None
+                    for p, a in self.adapters.items():
+                        if p.value == platform_name:
+                            adapter = a
+                            break
+                    if adapter and chat_id:
+                        try:
+                            from gateway.platforms.base import MessageEvent, MessageType
+                            from gateway.session import SessionSource
+                            from gateway.config import Platform
+                            _platform_enum = Platform(platform_name)
+                            _source = SessionSource(
+                                platform=_platform_enum,
+                                chat_id=chat_id,
+                                thread_id=thread_id or None,
+                            )
+                            synth_event = MessageEvent(
+                                text=synth_text,
+                                message_type=MessageType.TEXT,
+                                source=_source,
+                            )
+                            logger.info(
+                                "Process %s finished — injecting agent notification for session %s",
+                                session_id, session_key,
+                            )
+                            await adapter.handle_message(synth_event)
+                        except Exception as e:
+                            logger.error("Agent notify injection error: %s", e)
+                    break
+
+                # --- Normal text-only notification ---
                 # Decide whether to notify based on mode
                 should_notify = (
                     notify_mode in ("all", "result")
@@ -5973,8 +6143,9 @@ class GatewayRunner:
                             logger.error("Watcher delivery error: %s", e)
                 break
 
-            elif has_new_output and notify_mode == "all":
+            elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output available -- deliver status update (only in "all" mode)
+                # Skip periodic updates for agent_notify watchers (they only care about completion)
                 new_output = session.output_buffer[-500:] if session.output_buffer else ""
                 message_text = (
                     f"[Background process {session_id} is still running~ "
@@ -7003,6 +7174,27 @@ class GatewayRunner:
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
             
+            # Safety net: if the pending text is a slash command (e.g. "/stop",
+            # "/new"), discard it — commands should never be passed to the agent
+            # as user input.  The primary fix is in base.py (commands bypass the
+            # active-session guard), but this catches edge cases where command
+            # text leaks through the interrupt_message fallback.
+            if pending and pending.strip().startswith("/"):
+                _pending_parts = pending.strip().split(None, 1)
+                _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
+                if _pending_cmd_word:
+                    try:
+                        from hermes_cli.commands import resolve_command as _rc_pending
+                        if _rc_pending(_pending_cmd_word):
+                            logger.info(
+                                "Discarding command '/%s' from pending queue — "
+                                "commands must not be passed as agent input",
+                                _pending_cmd_word,
+                            )
+                            pending = None
+                    except Exception:
+                        pass
+
             if pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
                 

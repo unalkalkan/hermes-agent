@@ -187,7 +187,7 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma")
+TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
@@ -744,7 +744,6 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
         "browser_type",
         "browser_scroll",
         "browser_console",
-        "browser_close",
         "browser_press",
         "browser_get_images",
         "browser_vision",

@@ -250,6 +250,33 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
 
+    def test_delivery_extracts_media_tags_before_send(self):
+        """Cron delivery should pass MEDIA attachments separately to the send helper."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "voice-job",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Title\nMEDIA:/tmp/test-voice.ogg")
+
+        send_mock.assert_called_once()
+        args, kwargs = send_mock.call_args
+        # Text content should have MEDIA: tag stripped
+        assert "MEDIA:" not in args[3]
+        assert "Title" in args[3]
+        # Media files should be forwarded separately
+        assert kwargs["media_files"] == [("/tmp/test-voice.ogg", False)]
+
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""
         from gateway.config import Platform
@@ -675,6 +702,18 @@ class TestSilentDelivery:
     def test_silent_with_note_suppresses_delivery(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+
+    def test_silent_trailing_suppresses_delivery(self):
+        """Agent appended [SILENT] after explanation text — must still suppress."""
+        response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
