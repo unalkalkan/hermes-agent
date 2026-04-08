@@ -6277,6 +6277,45 @@ class GatewayRunner:
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
         
+        def _format_camofox_terminal_progress(command: str) -> Optional[str]:
+            """Return a friendly progress line for Camofox terminal calls.
+
+            Keeps generic terminal UX unchanged, but hides raw shell commands
+            for Camofox Browser API steps (health/tabs/snapshot/transcript/etc).
+            """
+            if not command:
+                return None
+            cmd = str(command)
+            low = cmd.lower()
+
+            # Camofox fingerprint: container/service name, env var, or known endpoints
+            if not (
+                "camofox" in low
+                or "camoufox" in low
+                or "camofox-browser" in low
+                or "camofox_base_url" in low
+                or "/youtube/transcript" in low
+                or "/tabs/" in low
+            ):
+                return None
+
+            if "/health" in low:
+                return "🦊 camofox: health check"
+            if "/start" in low:
+                return "🦊 camofox: starting browser engine"
+            if "/youtube/transcript" in low:
+                return "🦊 camofox: fetching YouTube transcript"
+            if "/tabs" in low and "-x post" in low:
+                return "🦊 camofox: opening browser tab"
+            if "/snapshot" in low:
+                return "🦊 camofox: reading page snapshot"
+            if "/navigate" in low:
+                return "🦊 camofox: navigating page"
+            if any(x in low for x in ("/click", "/type", "/press", "/scroll", "/back", "/forward", "/refresh")):
+                return "🦊 camofox: interacting with page"
+
+            return "🦊 camofox: browser step"
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue:
@@ -6312,6 +6351,28 @@ class GatewayRunner:
                     msg = f"{emoji} {tool_name}..."
                 progress_queue.put(msg)
                 return
+
+            # Camofox-specific UX polish: keep terminal command details hidden.
+            if tool_name in ("terminal", "execute_code"):
+                command = ""
+                if isinstance(args, dict):
+                    if tool_name == "terminal":
+                        command = args.get("command", "")
+                    else:
+                        # execute_code carries the script in args['code']
+                        command = args.get("code", "")
+                camofox_msg = _format_camofox_terminal_progress(command)
+                if camofox_msg:
+                    msg = camofox_msg
+                    # Dedup handling stays consistent with normal path
+                    if msg == last_progress_msg[0]:
+                        repeat_count[0] += 1
+                        progress_queue.put(("__dedup__", msg, repeat_count[0]))
+                        return
+                    last_progress_msg[0] = msg
+                    repeat_count[0] = 0
+                    progress_queue.put(msg)
+                    return
             
             # "all" / "new" modes: short preview, always truncated (40 chars)
             if preview:
