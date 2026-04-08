@@ -142,12 +142,6 @@ from tools.approval import (
 )
 
 
-def _check_dangerous_command(command: str, env_type: str) -> dict:
-    """Delegate to the consolidated approval module, passing the CLI callback."""
-    return _check_dangerous_command_impl(command, env_type,
-                                         approval_callback=_approval_callback)
-
-
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
@@ -720,8 +714,6 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     """Clean up environments that have been inactive for longer than lifetime_seconds."""
-    global _active_environments, _last_activity
-
     current_time = time.time()
 
     # Check the process registry -- skip cleanup for sandboxes with active
@@ -784,8 +776,6 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
 
 def _cleanup_thread_worker():
     """Background thread worker that periodically cleans up inactive environments."""
-    global _cleanup_running
-
     while _cleanup_running:
         try:
             config = _get_env_config()
@@ -821,6 +811,12 @@ def _stop_cleanup_thread():
             pass
 
 
+def get_active_env(task_id: str):
+    """Return the active BaseEnvironment for *task_id*, or None."""
+    with _env_lock:
+        return _active_environments.get(task_id)
+
+
 def get_active_environments_info() -> Dict[str, Any]:
     """Get information about currently active environments."""
     info = {
@@ -831,7 +827,7 @@ def get_active_environments_info() -> Dict[str, Any]:
     
     # Calculate total disk usage (per-task to avoid double-counting)
     total_size = 0
-    for task_id in _active_environments.keys():
+    for task_id in _active_environments:
         scratch_dir = _get_scratch_dir()
         pattern = f"hermes-*{task_id[:8]}*"
         import glob
@@ -848,8 +844,6 @@ def get_active_environments_info() -> Dict[str, Any]:
 
 def cleanup_all_environments():
     """Clean up ALL active environments. Use with caution."""
-    global _active_environments, _last_activity
-    
     task_ids = list(_active_environments.keys())
     cleaned = 0
     
@@ -877,8 +871,6 @@ def cleanup_all_environments():
 
 def cleanup_vm(task_id: str):
     """Manually clean up a specific environment by task_id."""
-    global _active_environments, _last_activity
-
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
@@ -1043,8 +1035,6 @@ def terminal_tool(
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
-    global _active_environments, _last_activity
-
     try:
         # Get configuration
         config = _get_env_config()
@@ -1633,4 +1623,5 @@ registry.register(
     handler=_handle_terminal,
     check_fn=check_terminal_requirements,
     emoji="💻",
+    max_result_size_chars=100_000,
 )
