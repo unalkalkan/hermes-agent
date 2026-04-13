@@ -52,6 +52,9 @@ ignored/
 .worktrees/
 environments/benchmarks/evals/
 
+# Web UI build output
+hermes_cli/web_dist/
+
 # Release script temp files
 .release_notes.md
 mini-swe-agent/
@@ -59,6 +62,6 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
-
 # Workspace
 workspace/
+website/static/api/skills-index.json

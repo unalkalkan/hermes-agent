@@ -16,6 +16,7 @@ venv
 
 # ── Node artifacts ───────────────────────────────────────────────────────────
 node_modules
+.venv
 
 # ── Docker build context exclusions ─────────────────────────────────────────
 hermes-data

@@ -71,6 +71,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # ── uv (fast Python package manager) ────────────────────────────────────────
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
+# ── GitHub Copilot CLI (ACP support) ─────────────────────────────────────────
+RUN curl -fsSL https://github.com/github/copilot-cli/releases/latest/download/copilot-linux-x64.tar.gz \
+    | tar xz -C /usr/local/bin copilot \
+    && chmod +x /usr/local/bin/copilot \
+    && copilot --version || true
+
 # ── Python 3.11 via uv ──────────────────────────────────────────────────────
 RUN uv python install 3.11
 
