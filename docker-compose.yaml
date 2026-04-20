@@ -68,6 +68,10 @@ services:
       - dind-storage:/var/lib/docker
 
     environment:
+      # Set TZ, UID and GID for handling permission issues
+      - TZ=${TZ:-UTC}
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       # Hermes config directory (inside the container)
       - HERMES_HOME=/data/hermes
       # Working directory for terminal commands

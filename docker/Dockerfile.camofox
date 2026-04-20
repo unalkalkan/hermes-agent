@@ -33,8 +33,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fontconfig \
     && rm -rf /var/lib/apt/lists/*
 
-# Install latest yt-dlp directly from upstream (Debian apt version can be stale)
-RUN curl -L --fail --retry 3 https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+# Install latest yt-dlp directly from upstream.
+# GitHub occasionally resets the connection during release downloads, so retry
+# aggressively and treat all transient transfer errors as retryable.
+RUN curl -fL \
+      --retry 8 \
+      --retry-all-errors \
+      --retry-delay 2 \
+      --connect-timeout 20 \
+      --max-time 300 \
+      --speed-time 30 \
+      --speed-limit 1024 \
+      https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+      -o /usr/local/bin/yt-dlp \
     && chmod a+rx /usr/local/bin/yt-dlp \
     && /usr/local/bin/yt-dlp --version
 
