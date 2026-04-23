@@ -165,7 +165,7 @@ class TestProviderPersistsAfterModelSave:
             "hermes_cli.auth.resolve_external_process_provider_credentials",
             return_value={
                 "provider": "copilot-acp",
-                "api_key": "copilot-acp",
+                "api_key": "***",
                 "base_url": "acp://copilot",
                 "command": "/usr/local/bin/copilot",
                 "args": ["--acp", "--stdio"],
@@ -175,7 +175,7 @@ class TestProviderPersistsAfterModelSave:
             "hermes_cli.auth.resolve_api_key_provider_credentials",
             return_value={
                 "provider": "copilot",
-                "api_key": "gh-cli-token",
+                "api_key": "***",
                 "base_url": "https://api.githubcopilot.com",
                 "source": "gh auth token",
             },
@@ -208,6 +208,49 @@ class TestProviderPersistsAfterModelSave:
         assert isinstance(model, dict), f"model should be dict, got {type(model)}"
         assert model.get("provider") == "copilot-acp"
         assert model.get("base_url") == "acp://copilot"
+        assert model.get("default") == "gpt-5.4"
+        assert model.get("api_mode") == "chat_completions"
+
+    def test_opencode_acp_provider_saved_when_selected(self, config_home):
+        """_model_flow_opencode_acp should persist provider/base_url/model together."""
+        from hermes_cli.main import _model_flow_opencode_acp
+        from hermes_cli.config import load_config
+
+        with patch(
+            "hermes_cli.auth.get_external_process_provider_status",
+            return_value={
+                "resolved_command": "/usr/local/bin/opencode",
+                "command": "opencode",
+                "base_url": "acp://opencode",
+            },
+        ), patch(
+            "hermes_cli.auth.resolve_external_process_provider_credentials",
+            return_value={
+                "provider": "opencode-acp",
+                "api_key": "***",
+                "base_url": "acp://opencode",
+                "command": "/usr/local/bin/opencode",
+                "args": ["acp"],
+                "source": "process",
+            },
+        ), patch(
+            "hermes_cli.main._fetch_opencode_acp_model_hints",
+            return_value=["gpt-5.4", "claude-sonnet-4.6"],
+        ), patch(
+            "hermes_cli.auth._prompt_model_selection",
+            return_value="gpt-5.4",
+        ), patch(
+            "hermes_cli.auth.deactivate_provider",
+        ):
+            _model_flow_opencode_acp(load_config(), "old-model")
+
+        import yaml
+
+        config = yaml.safe_load((config_home / "config.yaml").read_text()) or {}
+        model = config.get("model")
+        assert isinstance(model, dict), f"model should be dict, got {type(model)}"
+        assert model.get("provider") == "opencode-acp"
+        assert model.get("base_url") == "acp://opencode"
         assert model.get("default") == "gpt-5.4"
         assert model.get("api_mode") == "chat_completions"
 

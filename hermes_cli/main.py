@@ -1514,6 +1514,8 @@ def select_provider_and_model(args=None):
         _model_flow_google_gemini_cli(config, current_model)
     elif selected_provider == "copilot-acp":
         _model_flow_copilot_acp(config, current_model)
+    elif selected_provider == "opencode-acp":
+        _model_flow_opencode_acp(config, current_model)
     elif selected_provider == "copilot":
         _model_flow_copilot(config, current_model)
     elif selected_provider == "custom":
@@ -3155,6 +3157,120 @@ def _model_flow_copilot(config, current_model=""):
                 print(f"Reasoning effort set to: {selected_effort}")
     else:
         print("No change.")
+
+
+def _fetch_opencode_acp_model_hints(command: str) -> list[str]:
+    """Best-effort model hint list from the local OpenCode CLI."""
+    import subprocess
+
+    if not command:
+        return []
+    try:
+        proc = subprocess.run(
+            [command, "models"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    models: list[str] = []
+    seen: set[str] = set()
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("{") or line.startswith("["):
+            continue
+        if line.startswith("Performing one time database migration") or line.startswith("sqlite-migration:"):
+            continue
+        if "/" in line:
+            line = line.split("/", 1)[1].strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        models.append(line)
+    return models
+
+
+def _model_flow_opencode_acp(config, current_model=""):
+    """OpenCode ACP flow using the local OpenCode CLI as the provider router."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.model_normalize import normalize_model_for_provider
+
+    del config
+
+    provider_id = "opencode-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = (
+        status.get("resolved_command") or status.get("command") or "opencode"
+    )
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  OpenCode ACP delegates Hermes turns to `opencode acp`.")
+    print("  Hermes keeps its own tool loop and sends your selected model as a hint.")
+    print("  OpenCode remains the source of truth for upstream provider auth and routing.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print(
+            "  Set HERMES_OPENCODE_ACP_COMMAND or OPENCODE_CLI_PATH if OpenCode CLI is installed elsewhere."
+        )
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+    normalized_current_model = normalize_model_for_provider(current_model, provider_id) or current_model
+    model_list = _fetch_opencode_acp_model_hints(str(creds.get("command") or resolved_command))
+
+    if model_list:
+        print(f"  Found {len(model_list)} model hint(s) from OpenCode CLI")
+        selected = _prompt_model_selection(model_list, current_model=normalized_current_model)
+    else:
+        print("  ⚠ Could not auto-detect models from OpenCode CLI — enter a model hint manually.")
+        print("    Hermes will pass this through to OpenCode; OpenCode still controls actual provider auth.")
+        try:
+            selected = input("Model hint: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            selected = None
+
+    if not selected:
+        print("No change.")
+        return
+
+    selected = normalize_model_for_provider(selected, provider_id) or selected
+    _save_model_choice(selected)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
 
 
 def _model_flow_copilot_acp(config, current_model=""):

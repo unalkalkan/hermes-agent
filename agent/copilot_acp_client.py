@@ -24,22 +24,51 @@ from typing import Any
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
+_ACP_RUNTIME_DEFAULTS: dict[str, dict[str, Any]] = {
+    "acp://copilot": {
+        "label": "Copilot ACP",
+        "command_envs": ("HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH"),
+        "args_env": "HERMES_COPILOT_ACP_ARGS",
+        "default_command": "copilot",
+        "default_args": ["--acp", "--stdio"],
+        "install_hint": "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+    },
+    "acp://opencode": {
+        "label": "OpenCode ACP",
+        "command_envs": ("HERMES_OPENCODE_ACP_COMMAND", "OPENCODE_CLI_PATH"),
+        "args_env": "HERMES_OPENCODE_ACP_ARGS",
+        "default_command": "opencode",
+        "default_args": ["acp"],
+        "install_hint": "Install OpenCode CLI or set HERMES_OPENCODE_ACP_COMMAND/OPENCODE_CLI_PATH.",
+    },
+}
+
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
 
-def _resolve_command() -> str:
-    return (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
+def _runtime_defaults(base_url: str | None = None) -> dict[str, Any]:
+    normalized = str(base_url or "").strip().lower()
+    for prefix, config in _ACP_RUNTIME_DEFAULTS.items():
+        if normalized.startswith(prefix):
+            return dict(config)
+    return dict(_ACP_RUNTIME_DEFAULTS[ACP_MARKER_BASE_URL])
 
 
-def _resolve_args() -> list[str]:
-    raw = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+def _resolve_command(base_url: str | None = None) -> str:
+    defaults = _runtime_defaults(base_url)
+    for env_var in defaults["command_envs"]:
+        value = os.getenv(env_var, "").strip()
+        if value:
+            return value
+    return defaults["default_command"]
+
+
+def _resolve_args(base_url: str | None = None) -> list[str]:
+    defaults = _runtime_defaults(base_url)
+    raw = os.getenv(defaults["args_env"], "").strip()
     if not raw:
-        return ["--acp", "--stdio"]
+        return list(defaults["default_args"])
     return shlex.split(raw)
 
 
@@ -271,9 +300,10 @@ class CopilotACPClient:
     ):
         self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
+        self._runtime_defaults = _runtime_defaults(self.base_url)
         self._default_headers = dict(default_headers or {})
-        self._acp_command = acp_command or command or _resolve_command()
-        self._acp_args = list(acp_args or args or _resolve_args())
+        self._acp_command = acp_command or command or _resolve_command(self.base_url)
+        self._acp_args = list(acp_args or args or _resolve_args(self.base_url))
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
@@ -370,13 +400,13 @@ class CopilotACPClient:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+                f"Could not start {self._runtime_defaults['label']} command '{self._acp_command}'. "
+                f"{self._runtime_defaults['install_hint']}"
             ) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(f"{self._runtime_defaults['label']} process did not expose stdin/stdout pipes.")
 
         self.is_closed = False
         with self._active_process_lock:

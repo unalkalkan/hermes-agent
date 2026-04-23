@@ -162,11 +162,26 @@ relink_source() {
     fi
 }
 
+# ── Persist OpenCode state under HERMES_HOME ─────────────────────────────────
+setup_opencode_persistence() {
+    local hermes_home="${HERMES_HOME:-/data/hermes}"
+    local opencode_root="$hermes_home/opencode"
+
+    mkdir -p "$opencode_root"/{config,data,state,cache}
+    mkdir -p /root/.config /root/.local/share /root/.local/state /root/.cache
+
+    ln -sfn "$opencode_root/config" /root/.config/opencode
+    ln -sfn "$opencode_root/data" /root/.local/share/opencode
+    ln -sfn "$opencode_root/state" /root/.local/state/opencode
+    ln -sfn "$opencode_root/cache" /root/.cache/opencode
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 # Run first-time setup before starting supervised services so log/config paths
 # exist and gateway can inherit variables from the persisted .env file.
 first_run_setup
+setup_opencode_persistence
 
 # Re-link source if host repo is mounted
 relink_source

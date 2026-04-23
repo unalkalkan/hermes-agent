@@ -166,6 +166,7 @@ class TestProviderLabel:
         assert provider_label("kimi") == "Kimi / Kimi Coding Plan"
         assert provider_label("copilot") == "GitHub Copilot"
         assert provider_label("copilot-acp") == "GitHub Copilot ACP"
+        assert provider_label("opencode-acp") == "OpenCode ACP"
         assert provider_label("auto") == "Auto"
 
     def test_unknown_provider_preserves_original_name(self):
