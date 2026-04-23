@@ -182,6 +182,87 @@ def _render_message_content(content: Any) -> str:
     return str(content).strip()
 
 
+
+# Mapping from OpenCode native tool names -> Hermes equivalents.
+# OpenCode executes tools itself (bash, read, glob, grep, web_search), so we
+# need to translate its rawInput into the shape Hermes expects.
+_OPENCODE_TOOL_MAP: dict[str, str] = {
+    "bash": "terminal",
+    "read": "read_file",
+    "glob": "search_files",
+    "grep": "search_files",
+    "web_search": "web_search",
+}
+
+
+def _convert_opencode_tool_calls(
+    raw_events: list[dict[str, Any]],
+) -> list[SimpleNamespace]:
+    """Convert OpenCode's structured tool_call events into Hermes SimpleNamespace format.
+    
+    Detects tool type from rawInput structure since title field can be descriptive.
+    """
+    result: list[SimpleNamespace] = []
+    for entry in raw_events:
+        tc_id = str(entry.get("id", ""))
+        if not tc_id:
+            continue
+        # Skip invalid/error entries
+        title = str(entry.get("title", ""))
+        if title.lower() in ("invalid", "invalid tool"):
+            continue
+        raw_input = entry.get("rawInput") or {}
+        if not isinstance(raw_input, dict):
+            raw_input = {}
+        # Skip entries with errors
+        if "error" in raw_input and not isinstance(raw_input["error"], list):
+            continue
+        
+        # Detect tool type from rawInput structure + title fallback
+        hermes_name: str | None = None
+        fn_args: dict[str, Any] = {}
+        
+        if "command" in raw_input:
+            # Terminal/bash command (has 'command' key)
+            hermes_name = "terminal"
+            fn_args = {"command": str(raw_input["command"])}
+        elif "path" in raw_input or "paths" in raw_input:
+            # File read
+            hermes_name = "read_file"
+            paths = raw_input.get("paths", []) or []
+            path_str = str(paths[0]) if isinstance(paths, list) and paths else str(raw_input.get("path", ""))
+            fn_args = {"path": path_str}
+        elif "query" in raw_input:
+            # Web search
+            hermes_name = "web_search"
+            fn_args = {"query": str(raw_input["query"])}
+        elif "pattern" in raw_input:
+            # File search (glob/grep)
+            hermes_name = "search_files"
+            fn_args = {"pattern": str(raw_input["pattern"])}
+        else:
+            # Try title-based mapping as fallback
+            hermes_name = _OPENCODE_TOOL_MAP.get(title, title)
+            fn_args = dict(raw_input)
+        
+        if not hermes_name:
+            continue
+        
+        result.append(
+            SimpleNamespace(
+                id=tc_id,
+                call_id=tc_id,
+                response_item_id=None,
+                type="function",
+                function=SimpleNamespace(
+                    name=hermes_name,
+                    arguments=json.dumps(fn_args, ensure_ascii=False),
+                ),
+            )
+        )
+    return result
+
+
 def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str]:
     if not isinstance(text, str) or not text.strip():
         return [], ""
@@ -359,12 +440,16 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
+        response_text, reasoning_text, raw_tool_calls = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
         )
 
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        # Merge structured event-based tool calls with XML-block-parsed ones.
+        xml_tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        event_tool_calls = _convert_opencode_tool_calls(raw_tool_calls)
+        tc_ids = {tc.id for tc in event_tool_calls} if event_tool_calls else set()
+        tool_calls = list(event_tool_calls) + [tc for tc in xml_tool_calls if tc.id not in tc_ids]
 
         usage = SimpleNamespace(
             prompt_tokens=0,
@@ -387,7 +472,7 @@ class CopilotACPClient:
             model=model or "copilot-acp",
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str, list[dict[str, Any]]]:
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -435,7 +520,7 @@ class CopilotACPClient:
 
         next_id = 0
 
-        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
+        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None, tool_calls: list[dict[str, Any]] | None = None) -> Any:
             nonlocal next_id
             next_id += 1
             request_id = next_id
@@ -463,6 +548,7 @@ class CopilotACPClient:
                     cwd=self._acp_cwd,
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
+                    tool_calls=tool_calls,
                 ):
                     continue
 
@@ -511,6 +597,7 @@ class CopilotACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
+            _raw_tool_calls: list[dict[str, Any]] = []
             _request(
                 "session/prompt",
                 {
@@ -524,8 +611,9 @@ class CopilotACPClient:
                 },
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
+                tool_calls=_raw_tool_calls,
             )
-            return "".join(text_parts), "".join(reasoning_parts)
+            return "".join(text_parts), "".join(reasoning_parts), _raw_tool_calls
         finally:
             self.close()
 
@@ -537,6 +625,7 @@ class CopilotACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        tool_calls: list[dict[str, Any]] | None = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -554,6 +643,37 @@ class CopilotACPClient:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
                 reasoning_parts.append(chunk_text)
+
+            # OpenCode ACP sends tool calls as structured events, not XML blocks.
+            elif kind == "tool_call" and tool_calls is not None:
+                _tc = {
+                    "id": str(update.get("toolCallId") or ""),
+                    "name": str(update.get("title") or ""),
+                    "kind": str(update.get("kind") or ""),
+                    "status": str(update.get("status") or ""),
+                    "rawInput": dict(update.get("rawInput") or {}),
+                }
+                tool_calls.append(_tc)
+
+            elif kind == "tool_call_update" and tool_calls is not None:
+                _tc_id = str(update.get("toolCallId") or "")
+                for entry in tool_calls:
+                    if entry.get("id") == _tc_id:
+                        entry["status"] = str(update.get("status") or entry.get("status", ""))
+                        entry.update({
+                            "title": str(update.get("title") or entry.get("title", "")),
+                            "kind": str(update.get("kind") or entry.get("kind", "")),
+                            "rawInput": dict(update.get("rawInput") or entry.get("rawInput", {})),
+                        })
+                        if str(update.get("status")) == "completed" and isinstance(content, list):
+                            result_texts = []
+                            for item in content:
+                                if isinstance(item, dict):
+                                    inner = item.get("content", {})
+                                    if isinstance(inner, dict) and inner.get("type") == "text":
+                                        result_texts.append(str(inner.get("text", "")))
+                            entry["result"] = "\n".join(t for t in result_texts if t)
+
             return True
 
         if process.stdin is None:
