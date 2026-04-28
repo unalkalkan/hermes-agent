@@ -84,6 +84,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from utils import atomic_replace
 
 
 def check_telegram_requirements() -> bool:
@@ -122,12 +123,12 @@ def _strip_mdv2(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Markdown table → code block conversion
+# Markdown table → Telegram-friendly row groups
 # ---------------------------------------------------------------------------
 # Telegram's MarkdownV2 has no table syntax — '|' is just an escaped literal,
 # so pipe tables render as noisy backslash-pipe text with no alignment.
-# Wrapping the table in a fenced code block makes Telegram render it as
-# monospace preformatted text with columns intact.
+# Reformating each row into a bold heading plus bullet list keeps the content
+# readable on mobile clients while preserving the source data.
 
 # Matches a GFM table delimiter row: optional outer pipes, cells containing
 # only dashes (with optional leading/trailing colons for alignment) separated
@@ -144,13 +145,49 @@ def _is_table_row(line: str) -> bool:
     return bool(stripped) and '|' in stripped
 
 
+def _split_markdown_table_row(line: str) -> list[str]:
+    """Split a simple GFM table row into stripped cell values."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _render_table_block_for_telegram(table_block: list[str]) -> str:
+    """Render a detected GFM table as Telegram-friendly row groups."""
+    if len(table_block) < 3:
+        return "\n".join(table_block)
+
+    headers = _split_markdown_table_row(table_block[0])
+    if len(headers) < 2:
+        return "\n".join(table_block)
+
+    rendered_rows: list[str] = []
+    for index, row in enumerate(table_block[2:], start=1):
+        cells = _split_markdown_table_row(row)
+        if len(cells) < len(headers):
+            cells.extend([""] * (len(headers) - len(cells)))
+        elif len(cells) > len(headers):
+            cells = cells[: len(headers)]
+
+        heading = next((cell for cell in cells if cell), f"Row {index}")
+        rendered_rows.append(f"**{heading}**")
+        rendered_rows.extend(
+            f"• {header}: {value}" for header, value in zip(headers, cells)
+        )
+
+    return "\n\n".join(rendered_rows)
+
+
 def _wrap_markdown_tables(text: str) -> str:
-    """Wrap GFM-style pipe tables in ``` fences so Telegram renders them.
+    """Rewrite GFM-style pipe tables into Telegram-friendly bullet groups.
 
     Detected by a row containing '|' immediately followed by a delimiter
     row matching :data:`_TABLE_SEPARATOR_RE`.  Subsequent pipe-containing
-    non-blank lines are consumed as the table body and included in the
-    wrapped block.  Tables inside existing fenced code blocks are left
+    non-blank lines are consumed as the table body and rewritten as
+    per-row bullet groups. Tables inside existing fenced code blocks are left
     alone.
     """
     if '|' not in text or '-' not in text:
@@ -187,9 +224,7 @@ def _wrap_markdown_tables(text: str) -> str:
             while j < len(lines) and _is_table_row(lines[j]):
                 table_block.append(lines[j])
                 j += 1
-            out.append('```')
-            out.extend(table_block)
-            out.append('```')
+            out.append(_render_table_block_for_telegram(table_block))
             i = j
             continue
 
@@ -334,6 +369,49 @@ class TelegramAdapter(BasePlatformAdapter):
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
 
+    async def _drain_polling_connections(self) -> None:
+        """Reset the httpx connection pool used for getUpdates polling.
+
+        Network errors (especially through proxies like sing-box) can leave
+        httpx connections in a half-closed state that still occupy pool slots.
+        After enough reconnect cycles the pool fills up entirely, causing
+        ``Pool timeout: All connections in the connection pool are occupied.``
+
+        We reset ONLY ``_request[0]`` (the getUpdates request) — the general
+        request (``_request[1]``) is left untouched so concurrent
+        ``send_message`` / ``edit_message`` calls are never interrupted.
+
+        Implementation note: accesses ``Bot._request[0]`` which is the
+        get-updates ``BaseRequest`` in the PTB 22.x internal tuple
+        ``(get_updates_request, general_request)``.  There is no public
+        accessor for the polling request; review if upgrading to PTB 23+.
+        """
+        if not (self._app and self._app.bot):
+            return
+        try:
+            # PTB 22.x: _request is a (get_updates, general) tuple;
+            # no public accessor exists for the polling request.
+            polling_req = self._app.bot._request[0]  # noqa: SLF001
+        except Exception:
+            return
+        try:
+            await polling_req.shutdown()
+        except Exception:
+            logger.debug(
+                "[%s] Polling request shutdown failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+        try:
+            await polling_req.initialize()
+            logger.debug(
+                "[%s] Polling request pool drained before reconnect", self.name
+            )
+        except Exception:
+            logger.debug(
+                "[%s] Polling request re-initialize failed (non-fatal)",
+                self.name, exc_info=True,
+            )
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
 
@@ -378,6 +456,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._app.updater.stop()
         except Exception:
             pass
+
+        await self._drain_polling_connections()
 
         try:
             await self._app.updater.start_polling(
@@ -426,6 +506,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             await asyncio.sleep(RETRY_DELAY)
+            await self._drain_polling_connections()
             try:
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
@@ -496,6 +577,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] DM topic '%s' already exists in chat %s (will be mapped from incoming messages)",
                     self.name, name, chat_id,
                 )
+            elif "not a forum" in error_text or "forums_disabled" in error_text:
+                logger.warning(
+                    "[%s] Cannot create DM topic '%s' in chat %s: Topics mode is not enabled. "
+                    "The user must open the DM with this bot in Telegram, tap the bot name "
+                    "at the top, and enable 'Topics' in chat settings before topics can be created.",
+                    self.name, name, chat_id,
+                )
             else:
                 logger.warning(
                     "[%s] Failed to create DM topic '%s' in chat %s: %s",
@@ -547,7 +635,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         _yaml.dump(config, f, default_flow_style=False, sort_keys=False)
                         f.flush()
                         os.fsync(f.fileno())
-                    os.replace(tmp_path, config_path)
+                    atomic_replace(tmp_path, config_path)
                 except BaseException:
                     try:
                         os.unlink(tmp_path)
@@ -696,7 +784,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
 
-            proxy_url = resolve_proxy_url("TELEGRAM_PROXY")
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in ("1", "true", "yes", "on"))
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
@@ -707,6 +794,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     ", ".join(fallback_ips),
                 )
 
+            proxy_targets = ["api.telegram.org", *fallback_ips]
+            proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
             if fallback_ips and not proxy_url and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
@@ -787,8 +876,28 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Telegram pushes updates to our HTTP endpoint.  This
                 # enables cloud platforms (Fly.io, Railway) to auto-wake
                 # suspended machines on inbound HTTP traffic.
+                #
+                # SECURITY: TELEGRAM_WEBHOOK_SECRET is REQUIRED. Without it,
+                # python-telegram-bot passes secret_token=None and the
+                # webhook endpoint accepts any HTTP POST — attackers can
+                # inject forged updates as if from Telegram. Refuse to
+                # start rather than silently run in fail-open mode.
+                # See GHSA-3vpc-7q5r-276h.
                 webhook_port = int(os.getenv("TELEGRAM_WEBHOOK_PORT", "8443"))
-                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
+                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+                if not webhook_secret:
+                    raise RuntimeError(
+                        "TELEGRAM_WEBHOOK_SECRET is required when "
+                        "TELEGRAM_WEBHOOK_URL is set. Without it, the "
+                        "webhook endpoint accepts forged updates from "
+                        "anyone who can reach it — see "
+                        "https://github.com/NousResearch/hermes-agent/"
+                        "security/advisories/GHSA-3vpc-7q5r-276h.\n\n"
+                        "Generate a secret and set it in your .env:\n"
+                        "  export TELEGRAM_WEBHOOK_SECRET=\"$(openssl rand -hex 32)\"\n\n"
+                        "Then register it with Telegram when setting the "
+                        "webhook via setWebhook's secret_token parameter."
+                    )
                 from urllib.parse import urlparse
                 webhook_path = urlparse(webhook_url).path or "/telegram"
 
@@ -1180,6 +1289,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Telegram message.
+
+        Used by the stream consumer's fresh-final cleanup path (ported
+        from openclaw/openclaw#72038) to remove long-lived preview
+        messages after sending the completed reply as a fresh message.
+        Telegram's Bot API ``deleteMessage`` works for bot-posted
+        messages in the last 48 hours.  Failures are non-fatal — the
+        caller leaves the preview in place and logs at debug level.
+        """
+        if not self._bot:
+            return False
+        try:
+            await self._bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to delete Telegram message %s: %s",
+                self.name, message_id, e,
+            )
+            return False
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "",
@@ -1706,7 +1840,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         
         try:
-            import os
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
             
@@ -1755,7 +1888,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            import os
             if not os.path.exists(image_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
 
@@ -2029,10 +2161,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         text = content
 
-        # 0) Pre-wrap GFM-style pipe tables in ``` fences.  Telegram can't
-        #    render tables natively, but fenced code blocks render as
-        #    monospace preformatted text with columns intact.  The wrapped
-        #    tables then flow through step (1) below as protected regions.
+        # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
+        #    before the normal MarkdownV2 conversions run.
         text = _wrap_markdown_tables(text)
 
         # 1) Protect fenced code blocks (``` ... ```)
@@ -2068,7 +2198,7 @@ class TelegramAdapter(BasePlatformAdapter):
             url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{display}]({url})')
 
-        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _convert_link, text)
+        text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _convert_link, text)
 
         # 4) Convert markdown headers (## Title) → bold *Title*
         def _convert_header(m):
@@ -2302,6 +2432,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     user = getattr(entity, "user", None)
                     if user and getattr(user, "id", None) == bot_id:
                         return True
+                elif entity_type == "bot_command" and expected:
+                    # Telegram's official group-disambiguation form for slash
+                    # commands (``/cmd@botname``) is emitted as a single
+                    # ``bot_command`` entity covering the whole span — there
+                    # is no accompanying ``mention`` entity. Treat it as a
+                    # direct address to this bot when the ``@botname`` suffix
+                    # matches. This is the form Telegram's own command menu
+                    # autocomplete produces in groups, so dropping it at the
+                    # mention gate would break /new, /reset, /help, ... for
+                    # every group that has ``require_mention`` enabled (#15415).
+                    offset = int(getattr(entity, "offset", -1))
+                    length = int(getattr(entity, "length", 0))
+                    if offset < 0 or length <= 0:
+                        continue
+                    command_text = source_text[offset:offset + length]
+                    at_index = command_text.find("@")
+                    if at_index < 0:
+                        continue
+                    if command_text[at_index:].strip().lower() == expected:
+                        return True
         return False
 
     def _message_matches_mention_patterns(self, message: Message) -> bool:
@@ -2328,10 +2478,16 @@ class TelegramAdapter(BasePlatformAdapter):
         DMs remain unrestricted. Group/supergroup messages are accepted when:
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
-        - the message is a command
         - the message replies to the bot
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
+
+        When ``require_mention`` is enabled, slash commands are not given
+        special treatment — they must pass the same mention/reply checks
+        as any other group message.  Users can still trigger commands via
+        the Telegram bot menu (``/command@botname``) or by explicitly
+        mentioning the bot (``@botname /command``), both of which are
+        recognised as mentions by :meth:`_message_mentions_bot`.
         """
         if not self._is_group_chat(message):
             return True
@@ -2345,8 +2501,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():
-            return True
-        if is_command:
             return True
         if self._is_reply_to_bot(message):
             return True
@@ -2816,13 +2970,11 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[Telegram] Analyzing sticker at %s", cached_path)
 
             from tools.vision_tools import vision_analyze_tool
-            import json as _json
-
             result_json = await vision_analyze_tool(
                 image_url=cached_path,
                 user_prompt=STICKER_VISION_PROMPT,
             )
-            result = _json.loads(result_json)
+            result = json.loads(result_json)
 
             if result.get("success"):
                 description = result.get("analysis", "a sticker")

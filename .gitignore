@@ -1,3 +1,4 @@
+.DS_Store
 /venv/
 /_pycache/
 *.pyc*
@@ -71,3 +72,4 @@ result
 # Workspace
 workspace/
 website/static/api/skills-index.json
+models-dev-upstream/

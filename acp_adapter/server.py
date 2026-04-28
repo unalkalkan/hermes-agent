@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
+import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Deque, Optional
@@ -51,7 +53,7 @@ try:
 except ImportError:
     from acp.schema import AuthMethod as AuthMethodAgent  # type: ignore[attr-defined]
 
-from acp_adapter.auth import detect_provider, has_provider
+from acp_adapter.auth import detect_provider
 from acp_adapter.events import (
     make_message_cb,
     make_step_cb,
@@ -59,7 +61,7 @@ from acp_adapter.events import (
     make_tool_progress_cb,
 )
 from acp_adapter.permissions import make_approval_callback
-from acp_adapter.session import SessionManager, SessionState
+from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,11 @@ except Exception:
 
 # Thread pool for running AIAgent (synchronous) in parallel.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
+
+# Server-side page size for list_sessions. The ACP ListSessionsRequest schema
+# does not expose a client-side limit, so this is a fixed cap that clients
+# paginate against using `cursor` / `next_cursor`.
+_LIST_SESSIONS_PAGE_SIZE = 50
 
 
 def _extract_text(
@@ -281,7 +288,11 @@ class HermesACPAgent(acp.Agent):
         try:
             from model_tools import get_tool_definitions
 
-            enabled_toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            enabled_toolsets = _expand_acp_enabled_toolsets(
+                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
+                mcp_server_names=[server.name for server in mcp_servers],
+            )
+            state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
             state.agent.tools = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
@@ -351,9 +362,18 @@ class HermesACPAgent(acp.Agent):
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
-        if has_provider():
-            return AuthenticateResponse()
-        return None
+        # Only accept authenticate() calls whose method_id matches the
+        # provider we advertised in initialize(). Without this check,
+        # authenticate() would acknowledge any method_id as long as the
+        # server has provider credentials configured — harmless under
+        # Hermes' threat model (ACP is stdio-only, local-trust), but poor
+        # API hygiene and confusing if ACP ever grows multi-method auth.
+        provider = detect_provider()
+        if not provider:
+            return None
+        if not isinstance(method_id, str) or method_id.strip().lower() != provider:
+            return None
+        return AuthenticateResponse()
 
     # ---- Session management -------------------------------------------------
 
@@ -437,7 +457,28 @@ class HermesACPAgent(acp.Agent):
         cwd: str | None = None,
         **kwargs: Any,
     ) -> ListSessionsResponse:
+        """List ACP sessions with optional ``cwd`` filtering and cursor pagination.
+
+        ``cwd`` is passed through to ``SessionManager.list_sessions`` which already
+        normalizes and filters by working directory. ``cursor`` is a ``session_id``
+        previously returned as ``next_cursor``; results resume after that entry.
+        Server-side page size is capped at ``_LIST_SESSIONS_PAGE_SIZE``; when more
+        results remain, ``next_cursor`` is set to the last returned ``session_id``.
+        """
         infos = self.session_manager.list_sessions(cwd=cwd)
+
+        if cursor:
+            for idx, s in enumerate(infos):
+                if s["session_id"] == cursor:
+                    infos = infos[idx + 1:]
+                    break
+            else:
+                # Unknown cursor -> empty page (do not fall back to full list).
+                infos = []
+
+        has_more = len(infos) > _LIST_SESSIONS_PAGE_SIZE
+        infos = infos[:_LIST_SESSIONS_PAGE_SIZE]
+
         sessions = []
         for s in infos:
             updated_at = s.get("updated_at")
@@ -451,7 +492,9 @@ class HermesACPAgent(acp.Agent):
                     updated_at=updated_at,
                 )
             )
-        return ListSessionsResponse(sessions=sessions)
+
+        next_cursor = sessions[-1].session_id if has_more and sessions else None
+        return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
 
     # ---- Prompt (core) ------------------------------------------------------
 
@@ -517,15 +560,48 @@ class HermesACPAgent(acp.Agent):
         agent.step_callback = step_cb
         agent.message_callback = message_cb
 
-        if approval_cb:
-            try:
-                from tools import terminal_tool as _terminal_tool
-                previous_approval_cb = getattr(_terminal_tool, "_approval_callback", None)
-                _terminal_tool.set_approval_callback(approval_cb)
-            except Exception:
-                logger.debug("Could not set ACP approval callback", exc_info=True)
+        # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
+        # Set it INSIDE _run_agent so the TLS write happens in the executor
+        # thread — setting it here would write to the event-loop thread's TLS,
+        # not the executor's. Also set HERMES_INTERACTIVE so approval.py
+        # takes the CLI-interactive path (which calls the registered
+        # callback via prompt_dangerous_approval) instead of the
+        # non-interactive auto-approve branch (GHSA-96vc-wcxf-jjff).
+        # ACP's conn.request_permission maps cleanly to the interactive
+        # callback shape — not the gateway-queue HERMES_EXEC_ASK path,
+        # which requires a notify_cb registered in _gateway_notify_cbs.
+        previous_approval_cb = None
+        previous_interactive = None
 
         def _run_agent() -> dict:
+            nonlocal previous_approval_cb, previous_interactive
+            # Bind HERMES_SESSION_KEY for this session so per-session caches
+            # (e.g. the interactive sudo password cache in tools.terminal_tool)
+            # scope to the ACP session rather than leaking across sessions
+            # that land on the same reused executor thread. This call runs
+            # inside a contextvars.copy_context() below, so the ContextVar
+            # write is isolated from other concurrent ACP sessions.
+            try:
+                from gateway.session_context import (
+                    clear_session_vars,
+                    set_session_vars,
+                )
+                session_tokens = set_session_vars(session_key=session_id)
+            except Exception:
+                session_tokens = None
+                clear_session_vars = None  # type: ignore[assignment]
+                logger.debug("Could not set ACP session context", exc_info=True)
+            if approval_cb:
+                try:
+                    from tools import terminal_tool as _terminal_tool
+                    previous_approval_cb = _terminal_tool._get_approval_callback()
+                    _terminal_tool.set_approval_callback(approval_cb)
+                except Exception:
+                    logger.debug("Could not set ACP approval callback", exc_info=True)
+            # Signal to tools.approval that we have an interactive callback
+            # and the non-interactive auto-approve path must not fire.
+            previous_interactive = os.environ.get("HERMES_INTERACTIVE")
+            os.environ["HERMES_INTERACTIVE"] = "1"
             try:
                 result = agent.run_conversation(
                     user_message=user_text,
@@ -537,15 +613,30 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                # Restore HERMES_INTERACTIVE.
+                if previous_interactive is None:
+                    os.environ.pop("HERMES_INTERACTIVE", None)
+                else:
+                    os.environ["HERMES_INTERACTIVE"] = previous_interactive
                 if approval_cb:
                     try:
                         from tools import terminal_tool as _terminal_tool
                         _terminal_tool.set_approval_callback(previous_approval_cb)
                     except Exception:
                         logger.debug("Could not restore approval callback", exc_info=True)
+                if session_tokens is not None and clear_session_vars is not None:
+                    try:
+                        clear_session_vars(session_tokens)
+                    except Exception:
+                        logger.debug("Could not clear ACP session context", exc_info=True)
 
         try:
-            result = await loop.run_in_executor(_executor, _run_agent)
+            # Wrap the executor call in a fresh copy of the current context so
+            # concurrent ACP sessions on the shared ThreadPoolExecutor don't
+            # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
+            # particular — used by the interactive sudo password cache scope).
+            ctx = contextvars.copy_context()
+            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
         except Exception:
             logger.exception("Executor error for session %s", session_id)
             return PromptResponse(stop_reason="end_turn")
@@ -613,8 +704,8 @@ class HermesACPAgent(acp.Agent):
             await self._conn.session_update(
                 session_id=session_id,
                 update=AvailableCommandsUpdate(
-                    sessionUpdate="available_commands_update",
-                    availableCommands=self._available_commands(),
+                    session_update="available_commands_update",
+                    available_commands=self._available_commands(),
                 ),
             )
         except Exception:
@@ -694,7 +785,9 @@ class HermesACPAgent(acp.Agent):
     def _cmd_tools(self, args: str, state: SessionState) -> str:
         try:
             from model_tools import get_tool_definitions
-            toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            toolsets = _expand_acp_enabled_toolsets(
+                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            )
             tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
             if not tools:
                 return "No tools available."
