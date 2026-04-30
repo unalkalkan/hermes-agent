@@ -1,52 +1,127 @@
-#
-# docker-compose.yml for Hermes Agent
+# ============================================================================
+# Hermes Agent — Docker Compose
+# ============================================================================
 #
 # Usage:
-#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
+#   docker compose up -d          # Start in background
+#   docker compose exec hermes hermes          # Interactive chat
+#   docker compose exec hermes hermes setup    # Run setup wizard
+#   docker compose exec hermes bash            # Shell into container
+#   docker compose logs -f hermes              # View logs
+#   docker compose down                        # Stop
 #
-# Set HERMES_UID / HERMES_GID to the host user that owns ~/.hermes so
-# files created inside the container stay readable/writable on the host.
-# The entrypoint remaps the internal `hermes` user to these values via
-# usermod/groupmod + gosu.
+# First-run:
+#   1. Copy .env.example to ./hermes-data/.env and fill in API keys, OR
+#   2. Run: docker compose exec hermes hermes setup
 #
-# Security notes:
-#   - The dashboard service binds to 127.0.0.1 by default. It stores API
-#     keys; exposing it on LAN without auth is unsafe. If you want remote
-#     access, use an SSH tunnel or put it behind a reverse proxy that
-#     adds authentication — do NOT pass --insecure --host 0.0.0.0.
-#   - The gateway's API server is off unless you uncomment API_SERVER_KEY
-#     and API_SERVER_HOST. See docs/user-guide/api-server.md before doing
-#     this on an internet-facing host.
-#
-services:
-  gateway:
-    build: .
-    image: hermes-agent
-    container_name: hermes
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ~/.hermes:/opt/data
-    environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
-      # To expose the OpenAI-compatible API server beyond localhost,
-      # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
-      # - API_SERVER_HOST=0.0.0.0
-      # - API_SERVER_KEY=${API_SERVER_KEY}
-    command: ["gateway", "run"]
+# ============================================================================
 
-  dashboard:
+services:
+  hermes:
     image: hermes-agent
-    container_name: hermes-dashboard
-    restart: unless-stopped
-    network_mode: host
-    depends_on:
-      - gateway
+    container_name: hermes-agent
+    hostname: hermes
+
+    # Required for Docker-in-Docker
+    privileged: true
+
+    # ── GPU access ──
+    # Expose all NVIDIA GPUs to the container.
+    # Requires nvidia-container-toolkit on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+          memory: 2G
+        limits:
+          memory: 8G
+
+    # Keep container running (hermes CLI is started interactively via exec)
+    command: ["tail", "-f", "/dev/null"]
+
+    # Interactive terminal support for `docker compose exec`
+    stdin_open: true
+    tty: true
+
     volumes:
-      - ~/.hermes:/opt/data
+      # ── Hermes Agent source code (live mount) ──
+      # The host project repo is mounted into the container so the agent
+      # can edit source files and commit to the git repository.
+      - .:/opt/hermes-agent
+
+      # ── Persistent Hermes data (config, sessions, logs, memories, skills) ──
+      # All user data lives here — survives container rebuilds.
+      - ./hermes-data:/data/hermes
+
+      # ── Workspace directory for the agent to operate on ──
+      # Mount your projects here so the agent can read/write files.
+      # Change the host path to your actual projects directory.
+      - ./workspace:/workspace
+
+      # ── Docker-in-Docker storage ──
+      # Named volume for inner Docker's image/container layer storage.
+      - dind-storage:/var/lib/docker
+
     environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
-    # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
-    command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+      # Set TZ, UID and GID for handling permission issues
+      - TZ=${TZ:-UTC}
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1001}
+      # Hermes config directory (inside the container)
+      - HERMES_HOME=/data/hermes
+      # Working directory for terminal commands
+      - TERMINAL_CWD=/workspace
+      # Docker socket for DinD (used by hermes docker terminal backend)
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # NVIDIA runtime — make all GPUs visible inside the container
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Brave Search API key for bx-search skill (set in host env or compose .env)
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
+      # Cloudflare API token for Wrangler/Cloudflare skills
+      - CLOUDFLARE_TOKEN=${CLOUDFLARE_TOKEN:-}
+      # Cloudflare account/zone defaults for tunnel automation scripts
+      - CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
+      - CF_ZONE_ID=${CF_ZONE_ID:-}
+      # Preferred local Camofox API endpoint (same Docker network)
+      - CAMOFOX_BASE_URL=${CAMOFOX_BASE_URL:-http://camofox-browser:9377}
+
+    restart: unless-stopped
+
+  camofox-browser:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.camofox
+      args:
+        CAMOFOX_REPO: ${CAMOFOX_REPO:-https://github.com/jo-inc/camofox-browser}
+        CAMOFOX_REF: ${CAMOFOX_REF:-master}
+    container_name: camofox-browser
+    hostname: camofox-browser
+
+    # Keep browser server accessible from host and from hermes container
+    ports:
+      - "9377:9377"
+
+    environment:
+      - CAMOFOX_PORT=9377
+      - NODE_ENV=production
+      # Optional hardening / auth for cookie-import endpoint
+      - CAMOFOX_API_KEY=${CAMOFOX_API_KEY:-}
+      # Optional proxy routing (uncomment/set in .env when needed)
+      - PROXY_HOST=${PROXY_HOST:-}
+      - PROXY_PORT=${PROXY_PORT:-}
+      - PROXY_USERNAME=${PROXY_USERNAME:-}
+      - PROXY_PASSWORD=${PROXY_PASSWORD:-}
+
+    volumes:
+      # Persist Camoufox binaries/cache and cookie files across restarts/rebuilds
+      - ./hermes-data/camofox:/data/camofox
+
+    restart: unless-stopped
+
+volumes:
+  dind-storage:
+    driver: local
